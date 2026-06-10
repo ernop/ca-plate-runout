@@ -59,16 +59,26 @@ static int  vloglen;
 static u64 nodes;
 static u64 node_budget;
 static bool aborted;
+static int best_remaining;   /* deepest progress of the current attempt */
+static u64 work_at_best;     /* work counter when that record was set */
 static int dirperm[4] = {0, 1, 2, 3};   /* per-worker direction priority */
 static int order_mode;                  /* candidate ordering variant */
 static bool randtie;                    /* randomized tie-breaking */
 static u64 rng = 0x9e3779b97f4a7c15ULL;
 static u64 seed_salt = 0x9e3779b97f4a7c15ULL;
-static bool use_forced;     /* forced-edge deficit pruning (off: net loss) */
-
 static u32 *mark;
 static u32 markgen;
 static u64 st_region_calls, st_region_cells, st_visits, st_branches;
+static u64 st_p_parity, st_p_struct, st_p_conn, st_p_lb3, st_p_cyc,
+           st_p_over, st_p_feas, st_p_dirs, st_p_tt;
+
+/* Transposition table of proven-dead states. A state is the visited set
+ * (Zobrist hash, maintained incrementally) plus the head cell. Search
+ * orders that permute into the same coverage collapse to one subtree. */
+#define TT_BITS 22
+static u64 *tt;
+static u64 *zkey, *zheadkey;
+static u64 zhash;
 
 static inline int cellcolor(int p) { return ((p % PW) + (p / PW)) & 1; }
 static inline bool free_cell(int p) { return !blocked[p]; }
@@ -90,6 +100,7 @@ static inline void visit_cell(int p)
 {
     blocked[p] = 1; remaining--;
     colorbal += cellcolor(p) ? 1 : -1;
+    zhash ^= zkey[p];
     /* p leaves the free set: remove its own leaf/isol contribution */
     if (deg[p] == 1) nleaf--;
     else if (deg[p] == 0) nisol--;
@@ -107,6 +118,7 @@ static void rewind_to(int loglen, int plen)
         int p = vlog[--vloglen];
         blocked[p] = 0; remaining++;
         colorbal += cellcolor(p) ? -1 : 1;
+        zhash ^= zkey[p];
         if (!blocked[p-1])  inc_deg(p-1);
         if (!blocked[p+1])  inc_deg(p+1);
         if (!blocked[p-PW]) inc_deg(p-PW);
@@ -148,11 +160,18 @@ static u32 *leafmark;        /* cell is valid endpoint (interior of a leaf
                                 block); generation = markgen of the call */
 static u8  *fdeg;            /* forced path-degree from deg-2 neighbors */
 static u32 *fmark;           /* generation guard for fdeg */
+static s32 *rlist;           /* cells of the region, in discovery order */
+static u32 *cycmark;         /* cell visited by a forced-component walk */
+static u32 *oncyc;           /* cell lies on a forced cycle */
+static u8  *lbid;            /* which of the 2 leaf blocks (when marked) */
 
 static int last_leafblocks;  /* result of the most recent region_ok */
+static int last_ncyc;        /* forced cycles found by most recent call */
 static u32 last_region_gen;
 
 static u64 work;             /* time-proxy budget counter */
+
+static bool analyze_region(int seed, int head);
 
 static bool region_ok(int pos)
 {
@@ -163,7 +182,28 @@ static bool region_ok(int pos)
     else if (free_cell(pos-PW)) seed = pos-PW;
     else if (free_cell(pos+PW)) seed = pos+PW;
     else return false;
+    return analyze_region(seed, pos);
+}
 
+/*
+ * Full structural analysis of the free region from seed (head = current
+ * search position, or -1 for the virgin board).
+ *
+ * 1. Tarjan biconnected-components walk: connectivity, leaf-block count
+ *    (>= 3 is fatal), endpoint marking (leaf-block interiors).
+ * 2. Forced-edge analysis: a free deg-2 cell must use both its edges
+ *    unless it is a path endpoint. Forced edges form disjoint segments
+ *    and cycles:
+ *      - a cell carrying > 2 forced edges needs endpoints spent on its
+ *        forcers; total overload > 2 is fatal
+ *      - every forced cycle needs >= 1 path endpoint on it
+ * 3. Endpoint-demand feasibility: only 2 endpoints exist; leaf blocks
+ *    demand one strictly inside each, cycles demand one on each; the
+ *    demands must be coverable by 2 cells (with the next-entered cell
+ *    adjacent to head).
+ */
+static bool analyze_region(int seed, int head)
+{
     if (dctr > 0xF0000000u) {           /* rare: reset before wraparound */
         memset(disc, 0, (size_t)NCELLS * sizeof(u32));
         dctr = 0;
@@ -171,6 +211,7 @@ static bool region_ok(int pos)
     markgen++;
     last_region_gen = markgen;
     last_leafblocks = 0;
+    last_ncyc = 0;
     u32 base = dctr + 1;     /* disc >= base <=> discovered this call */
     u32 counter = dctr;
     dctr += (u32)remaining + 1;  /* reserve range (early returns safe) */
@@ -180,35 +221,12 @@ static bool region_ok(int pos)
     int root_children = 0;
     int rb_start[5], rb_cuts[5], nrb = 0;   /* root blocks (<=4) */
     int rbn = 0;
-    int deficit = 0;    /* forced path-degree overload, max 2 fixable */
 
     tstack[0] = seed; tdirs[0] = 0; tparent[0] = -1;
     disc[seed] = low[seed] = ++counter;
     sepflag[seed] = 0;
+    rlist[0] = seed;
     int top = 1;
-
-    /*
-     * Forced-edge accounting: a free cell with exactly 2 free neighbors
-     * must use both incident edges unless it is one of the path's 2
-     * endpoints. Each endpoint placed at such a cell relaxes one forced
-     * edge. A cell x can carry at most 2 path edges, so any forced count
-     * beyond 2 must be paid for by an endpoint; total budget is 2.
-     */
-#define FORCE_FROM(v)                                                     \
-    do {                                                                  \
-        if (use_forced && deg[v] == 2) {                                  \
-            for (int _i = 0; _i < 4; _i++) {                              \
-                int _x = (v) + DELTA[_i];                                 \
-                if (!free_cell(_x)) continue;                             \
-                if (fmark[_x] != markgen) { fmark[_x] = markgen; fdeg[_x] = 0; } \
-                if (++fdeg[_x] > 2) {                                     \
-                    if (++deficit > 2) return false;                      \
-                }                                                         \
-            }                                                             \
-        }                                                                 \
-    } while (0)
-
-    FORCE_FROM(seed);
 
     while (top > 0) {
         int u = tstack[top-1];
@@ -227,8 +245,8 @@ static bool region_ok(int pos)
             }
             disc[v] = low[v] = ++counter;
             sepflag[v] = 0;
+            rlist[cnt] = v;
             cnt++;
-            FORCE_FROM(v);
             estack[esp] = v; eother[esp] = u; esp++;   /* tree edge */
             tstack[top] = v; tdirs[top] = 0; tparent[top] = u;
             top++;
@@ -280,12 +298,17 @@ static bool region_ok(int pos)
                         if (a == u && b == p) break;
                     }
                     if (cuts <= 1) {
-                        if (++leafblocks >= 3) return false;
+                        if (++leafblocks >= 3) { st_p_lb3++; return false; }
+                        u8 bid = (u8)(leafblocks - 1);
                         for (int e = esp; e < mstart; e++) {
-                            if (!sepflag[estack[e]])
+                            if (!sepflag[estack[e]]) {
                                 leafmark[estack[e]] = markgen;
-                            if (!sepflag[eother[e]])
+                                lbid[estack[e]] = bid;
+                            }
+                            if (!sepflag[eother[e]]) {
                                 leafmark[eother[e]] = markgen;
+                                lbid[eother[e]] = bid;
+                            }
                         }
                     }
                 }
@@ -295,22 +318,113 @@ static bool region_ok(int pos)
 
     work += (u32)cnt >> 3;
     st_region_calls++; st_region_cells += cnt;
-    if (cnt != remaining) return false;
+    if (cnt != remaining) { st_p_conn++; return false; }
 
     /* classify deferred root blocks */
     bool root_cut = root_children >= 2;
     for (int i = 0; i < nrb; i++) {
         int cuts = rb_cuts[i] + (root_cut ? 1 : 0);
         if (cuts <= 1) {
-            if (++leafblocks >= 3) return false;
+            if (++leafblocks >= 3) { st_p_lb3++; return false; }
+            u8 bid = (u8)(leafblocks - 1);
             int end = (i + 1 < nrb) ? rb_start[i+1] : rbn;
             for (int j = rb_start[i]; j < end; j++)
-                if (!sepflag[rbuf[j]]) leafmark[rbuf[j]] = markgen;
-            if (!root_cut) leafmark[seed] = markgen;
+                if (!sepflag[rbuf[j]]) {
+                    leafmark[rbuf[j]] = markgen;
+                    lbid[rbuf[j]] = bid;
+                }
+            if (!root_cut) { leafmark[seed] = markgen; lbid[seed] = bid; }
         }
     }
 
     last_leafblocks = leafblocks;
+
+    /* ---- forced-edge analysis ---- */
+    if (remaining >= 12) {
+        /* forced degree per cell: F(x) = 2 if deg[x]==2 (its own edges),
+         * else the number of deg-2 free neighbors forcing an edge on it */
+        int overload = 0;
+        for (int i = 0; i < cnt; i++) {
+            int v = rlist[i];
+            if (deg[v] != 2) continue;
+            for (int d = 0; d < 4; d++) {
+                int x = v + DELTA[d];
+                if (!free_cell(x)) continue;
+                if (fmark[x] != markgen) { fmark[x] = markgen; fdeg[x] = 0; }
+                if (++fdeg[x] > 2 && deg[x] != 2) {
+                    if (++overload > 2) { st_p_over++; return false; }
+                }
+            }
+        }
+
+        /* walk forced components: disjoint segments and cycles */
+        int ncyc = 0;
+        bool cyB[2][2] = {{false, false}, {false, false}};
+        bool cyHead[2] = {false, false};
+        for (int i = 0; i < cnt; i++) {
+            int v = rlist[i];
+            if (deg[v] != 2 || cycmark[v] == markgen) continue;
+            /* trace from v through cells whose 2 forced edges are known */
+            int clen = 0;
+            int prev = -1, cur = v;
+            bool cycle = false;
+            for (;;) {
+                cycmark[cur] = markgen;
+                rbuf[clen++] = cur;
+                /* the forced edges at cur */
+                int nxt = -1;
+                if (deg[cur] == 2) {
+                    for (int d = 0; d < 4; d++) {
+                        int x = cur + DELTA[d];
+                        if (free_cell(x) && x != prev) { nxt = x; break; }
+                    }
+                } else {
+                    if (fmark[cur] != markgen || fdeg[cur] != 2) break;
+                    for (int d = 0; d < 4; d++) {
+                        int x = cur + DELTA[d];
+                        if (free_cell(x) && deg[x] == 2 && x != prev) { nxt = x; break; }
+                    }
+                }
+                if (nxt < 0) break;            /* segment end */
+                if (nxt == v) { cycle = true; break; }
+                if (cycmark[nxt] == markgen) break;  /* joins walked part */
+                prev = cur; cur = nxt;
+            }
+            if (!cycle) continue;
+            if (ncyc == 2) { st_p_cyc++; return false; }  /* 3 cycles */
+            for (int j = 0; j < clen; j++) {
+                int c = rbuf[j];
+                oncyc[c] = markgen;
+                if (leafblocks == 2 && leafmark[c] == markgen)
+                    cyB[ncyc][lbid[c]] = true;
+            }
+            if (head >= 0) {
+                for (int d = 0; d < 4; d++) {
+                    int x = head + DELTA[d];
+                    if (free_cell(x) && oncyc[x] == markgen) {
+                        for (int j = 0; j < clen; j++)
+                            if (rbuf[j] == x) { cyHead[ncyc] = true; break; }
+                    }
+                }
+            }
+            ncyc++;
+        }
+
+        /* endpoint-demand feasibility (2 endpoints total) */
+        if (leafblocks == 2) {
+            if (ncyc == 1 && !cyB[0][0] && !cyB[0][1]) { st_p_feas++; return false; }
+            if (ncyc == 2 &&
+                !(cyB[0][0] && cyB[1][1]) && !(cyB[0][1] && cyB[1][0])) {
+                st_p_feas++; return false;
+            }
+        } else if (ncyc == 2 && head >= 0) {
+            /* one endpoint is the next entered cell (a head neighbor):
+             * it must lie on one of the two cycles */
+            if (!cyHead[0] && !cyHead[1]) { st_p_feas++; return false; }
+        }
+        last_ncyc = ncyc;
+    }
+
     return true;
 }
 
@@ -390,8 +504,8 @@ static bool dfs(int pos)
     for (;;) {
         if (remaining == 0) return true;
         if (aborted) return false;
-        if (!struct_ok(pos)) return false;
-        if (!parity_ok(pos)) return false;
+        if (!struct_ok(pos)) { st_p_struct++; return false; }
+        if (!parity_ok(pos)) { st_p_parity++; return false; }
 
         int dirs[4], nd = 0;
         for (int i = 0; i < 4; i++) {
@@ -408,40 +522,19 @@ static bool dfs(int pos)
             continue;
         }
 
-        nodes++; work++; st_branches++;
-        if (work > node_budget) { aborted = true; return false; }
-
-        bool fresh_region = false;
-        if ((dirty_conn || always_check) && (++checktick & checkmask) == 0) {
-            if (!region_ok(pos)) return false;
-            dirty_conn = false;
-            fresh_region = true;
-        }
-
         /* With exactly 2 leaves the path must start at a leaf: restrict
          * to directions whose first cell is a leaf. */
         if (nleaf == 2) {
             int fd[4], fn = 0;
             for (int k = 0; k < nd; k++)
                 if (deg[pos + DELTA[dirs[k]]] == 1) fd[fn++] = dirs[k];
-            if (fn == 0) return false;
+            if (fn == 0) { st_p_dirs++; return false; }
             memcpy(dirs, fd, fn * sizeof(int)); nd = fn;
         }
 
-        /* With exactly 2 leaf blocks, the next entered cell is one of the
-         * two path endpoints, which must lie strictly inside a leaf block. */
-        if (fresh_region && last_leafblocks == 2) {
-            int fd[4], fn = 0;
-            for (int k = 0; k < nd; k++)
-                if (leafmark[pos + DELTA[dirs[k]]] == last_region_gen)
-                    fd[fn++] = dirs[k];
-            if (fn == 0) return false;
-            memcpy(dirs, fd, fn * sizeof(int)); nd = fn;
-        }
-
-        /* Lookahead each candidate slide: skip guaranteed-dead ones,
-         * take instant wins, order the rest by end constrainedness. */
-        int cand[4], key[4], nc = 0;
+        /* Cheap lookahead BEFORE paying for a branch node: simulate each
+         * candidate slide, take instant wins, drop dead-on-arrival ones. */
+        int cand[4], ceo[4], nc = 0;
         for (int k = 0; k < nd; k++) {
             int len, eo;
             sim_slide(pos, dirs[k], &len, &eo);
@@ -451,21 +544,77 @@ static bool dfs(int pos)
                 return true;
             }
             if (eo == 0) continue;            /* dead end, not a win: skip */
-            int kk;
-            switch (order_mode) {
-            case 1:  kk = (eo == 1 ? 0 : 1 << 20) - len; break; /* tie: long */
-            case 2:  kk = (eo == 1 ? 0 : 1 << 20) + len; break; /* tie: short */
-            default: kk = (eo == 1) ? 0 : 8;  break;
-            }
+            cand[nc] = dirs[k]; ceo[nc] = eo; nc++;
+        }
+        if (nc == 0) return false;
+
+        if (nc == 1) {
+            /* pseudo-forced: all alternatives provably dead */
+            path[pathlen++] = DIRCH[cand[0]];
+            pos = do_slide(pos, cand[0]);
+            continue;
+        }
+
+        nodes++; work++; st_branches++;
+        if (remaining < best_remaining) {
+            best_remaining = remaining;
+            work_at_best = work;
+        }
+        if (work > node_budget) { aborted = true; return false; }
+
+        /* transposition: this coverage + head already proven dead? */
+        u64 ttkey = zhash ^ zheadkey[pos];
+        u32 ttidx = (u32)((ttkey * 0x9e3779b97f4a7c15ULL) >> (64 - TT_BITS));
+        if (tt[ttidx] == ttkey) { st_p_tt++; return false; }
+
+        bool fresh_region = false;
+        if ((dirty_conn || always_check) && (++checktick & checkmask) == 0) {
+            if (!region_ok(pos)) return false;
+            dirty_conn = false;
+            fresh_region = true;
+        }
+
+        /* The next entered cell is a path endpoint. With exactly 2 leaf
+         * blocks it must lie strictly inside one; with 2 forced cycles it
+         * must lie on one (each cycle claims an endpoint). */
+        if (fresh_region && last_leafblocks == 2) {
+            int fd[4], fe[4], fn = 0;
+            for (int k = 0; k < nc; k++)
+                if (leafmark[pos + DELTA[cand[k]]] == last_region_gen) {
+                    fd[fn] = cand[k]; fe[fn] = ceo[k]; fn++;
+                }
+            if (fn == 0) { st_p_dirs++; return false; }
+            memcpy(cand, fd, fn * sizeof(int));
+            memcpy(ceo, fe, fn * sizeof(int)); nc = fn;
+        }
+        if (fresh_region && last_ncyc == 2) {
+            int fd[4], fe[4], fn = 0;
+            for (int k = 0; k < nc; k++)
+                if (oncyc[pos + DELTA[cand[k]]] == last_region_gen) {
+                    fd[fn] = cand[k]; fe[fn] = ceo[k]; fn++;
+                }
+            if (fn == 0) { st_p_dirs++; return false; }
+            memcpy(cand, fd, fn * sizeof(int));
+            memcpy(ceo, fe, fn * sizeof(int)); nc = fn;
+        }
+
+        /* order: forced-continuation ends first, randomized within class */
+        int key[4];
+        for (int k = 0; k < nc; k++) {
+            int kk = (ceo[k] == 1) ? 0 : 8;
             if (randtie) {
                 rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-                kk = kk * 8 + (int)(rng & 7);   /* shuffle within class */
+                kk = kk * 8 + (int)(rng & 7);
             }
-            int a = nc++;
-            while (a > 0 && key[a-1] > kk) {
-                cand[a] = cand[a-1]; key[a] = key[a-1]; a--;
+            key[k] = kk;
+        }
+        for (int a = 1; a < nc; a++) {
+            int da = cand[a], ka = key[a];
+            int b = a - 1;
+            while (b >= 0 && key[b] > ka) {
+                cand[b+1] = cand[b]; key[b+1] = key[b]; b--;
             }
-            cand[a] = dirs[k]; key[a] = kk;
+            cand[b+1] = da; key[b+1] = ka;
         }
 
         for (int k = 0; k < nc; k++) {
@@ -477,6 +626,9 @@ static bool dfs(int pos)
             rewind_to(saveL, saveP);
             dirty_conn = saveD;
         }
+        /* fully explored and failed: remember as dead (only if the
+         * subtree was not truncated by budget or stall cutoffs) */
+        if (!aborted) tt[ttidx] = ttkey;
         return false;
     }
 }
@@ -487,6 +639,7 @@ static bool solve_from(int start)
     dirty_conn = true;          /* removing the start cell may split */
     visit_cell(start);
     nodes = 0; work = 0; aborted = false;
+    best_remaining = remaining; work_at_best = 0;
     if (dfs(start)) return true;
     rewind_to(saveL, saveP);
     return false;
@@ -520,6 +673,28 @@ int main(void)
     leafmark = calloc(NCELLS, sizeof(u32));
     fdeg    = calloc(NCELLS, 1);
     fmark   = calloc(NCELLS, sizeof(u32));
+    rlist   = malloc((size_t)NCELLS * sizeof(s32));
+    cycmark = calloc(NCELLS, sizeof(u32));
+    oncyc   = calloc(NCELLS, sizeof(u32));
+    lbid    = calloc(NCELLS, 1);
+    tt      = calloc((size_t)1 << TT_BITS, sizeof(u64));
+    zkey    = malloc((size_t)NCELLS * sizeof(u64));
+    zheadkey = malloc((size_t)NCELLS * sizeof(u64));
+    {
+        u64 s = 0x243f6a8885a308d3ULL;
+        for (int i = 0; i < NCELLS; i++) {
+            s += 0x9e3779b97f4a7c15ULL;
+            u64 z = s;
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+            zkey[i] = z ^ (z >> 31);
+            s += 0x9e3779b97f4a7c15ULL;
+            z = s;
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+            zheadkey[i] = z ^ (z >> 31);
+        }
+    }
 
     memset(blocked, 1, NCELLS);
     total_empty = 0;
@@ -567,6 +742,22 @@ int main(void)
         return 0;
     }
 
+    /*
+     * Initial block-cut analysis: the path's two endpoints (start cell and
+     * final cell) must each lie strictly inside a leaf block of the board
+     * graph. With >= 3 leaf blocks the level is unsolvable; with exactly 2
+     * the start candidates shrink to the two leaf-block interiors.
+     */
+    int seed0 = -1;
+    for (int p = 0; p < NCELLS && seed0 < 0; p++)
+        if (!blocked[p]) seed0 = p;
+    bool restrict_lb = false;
+    u32 lb_gen = 0;
+    if (seed0 >= 0) {
+        if (!analyze_region(seed0, -1)) { printf("No solution found\n"); return 0; }
+        if (last_leafblocks == 2) { restrict_lb = true; lb_gen = last_region_gen; }
+    }
+
     int *order = malloc((size_t)total_empty * sizeof(int));
     int ns = 0;
     if (nleaves == 2) {
@@ -585,6 +776,7 @@ int main(void)
                     if (blocked[p]) continue;
                     if (nleaves == 1 && p == leaves[0]) continue;
                     if (need_color >= 0 && cellcolor(p) != need_color) continue;
+                    if (restrict_lb && leafmark[p] != lb_gen) continue;
                     int x = p % PW - 1, y = p / PW - 1;
                     int r = x;
                     if (y < r) r = y;
@@ -599,6 +791,7 @@ int main(void)
                     if (blocked[p]) continue;
                     if (nleaves == 1 && p == leaves[0]) continue;
                     if (need_color >= 0 && cellcolor(p) != need_color) continue;
+                    if (restrict_lb && leafmark[p] != lb_gen) continue;
                     if (deg[p] == pass) order[ns++] = p;
                 }
             }
@@ -607,7 +800,19 @@ int main(void)
 
     if (ns == 0) { printf("No solution found\n"); return 0; }
 
+    /* diagnostic: force a single specific start cell */
+    if (getenv("COIL_FIXED_START")) {
+        int fx, fy;
+        if (sscanf(getenv("COIL_FIXED_START"), "%d,%d", &fx, &fy) == 2) {
+            order[0] = (fy + 1) * PW + (fx + 1);
+            ns = 1;
+        }
+    }
+
     bool dbg = getenv("COIL_DEBUG") != NULL;
+    if (dbg)
+        fprintf(stderr, "init: empty=%d leafblocks=%d restrict=%d starts=%d\n",
+                total_empty, last_leafblocks, (int)restrict_lb, ns);
     always_check = getenv("COIL_LAZY_CHECK") == NULL;  /* default: always */
     order_mode = getenv("COIL_ORDER") ? atoi(getenv("COIL_ORDER")) : 0;
     randtie = getenv("COIL_NORANDTIE") == NULL;        /* default: on */
@@ -629,7 +834,6 @@ int main(void)
             int t = order[i]; order[i] = order[j]; order[j] = t;
         }
     }
-    use_forced = getenv("COIL_FORCED") != NULL;
     int nworkers = 4;
     {
         const char *env = getenv("COIL_WORKERS");
@@ -658,7 +862,7 @@ int main(void)
                     if (devnull >= 0) { dup2(devnull, 2); close(devnull); }
                 }
             }
-            FILE *out = fdopen(pipes[w][1], "w");
+            FILE *out = (nworkers > 1) ? fdopen(pipes[w][1], "w") : stdout;
             for (int i = 0; i < 4; i++) dirperm[i] = (i + w) & 3;
             if (!getenv("COIL_CHECK_EVERY")) {
                 /* diversify region-check cadence across workers */
@@ -671,28 +875,97 @@ int main(void)
                 order_mode = omode[w & 3];
             }
 
-            u8 *dead = calloc(ns, 1);
-            /* work units scale with board size (region scans dominate).
-             * Winning starts typically solve within a few thousand branch
-             * nodes; scan many starts cheaply before going deep. */
+            /*
+             * Progress-guided restarts: tier 0 probes every start with a
+             * small budget and records how deep each attempt got (fewest
+             * cells left). Each later tier keeps only the most promising
+             * half of the field (at least 16), re-ordered by progress,
+             * with 8x the budget and fresh randomized tie-breaking.
+             */
+            int nmine = 0;
+            int *act  = malloc((size_t)ns * sizeof(int));
+            int *prog = malloc((size_t)ns * sizeof(int));
+            for (int k = w; k < ns; k += nworkers) act[nmine++] = k;
+
+            if (getenv("COIL_TIERS") == NULL) {
+                /*
+                 * Two-pass sweep. Dead starts are cheap to disprove with
+                 * the pruning + transposition table (which persists and
+                 * grows across starts), and winning starts solve within a
+                 * small budget, so:
+                 *   pass 1: every start, capped budget - finds the winner
+                 *           or defers the rare monster dead trees
+                 *   pass 2: exhaust the deferred starts, deepest-progress
+                 *           first (complete: proves unsolvable if so)
+                 */
+                int defer = 0;
+                node_budget = (u64)900 * (u64)total_empty;
+                for (int i = 0; i < nmine; i++) {
+                    int k = act[i];
+                    rng = seed_salt ^ ((u64)(k+1) << 16);
+                    rng ^= rng >> 33; rng *= 0xff51afd7ed558ccdULL; rng ^= rng >> 33;
+                    bool ok = solve_from(order[k]);
+                    if (dbg)
+                        fprintf(stderr, "w%d pass1 start#%d/%d pos=(%d,%d) nodes=%llu %s\n",
+                                w, k, ns, order[k] % PW - 1, order[k] / PW - 1,
+                                (unsigned long long)nodes,
+                                ok ? "SOLVED" : (aborted ? "defer" : "dead"));
+                    if (ok) {
+                        int sx = order[k] % PW - 1, sy = order[k] / PW - 1;
+                        path[pathlen] = 0;
+                        fprintf(out, "x=%d&y=%d&path=%s\n", sx, sy, path);
+                        fflush(out);
+                        _exit(0);
+                    }
+                    if (aborted) {
+                        act[defer] = k; prog[defer] = best_remaining; defer++;
+                    }
+                }
+                for (int a = 1; a < defer; a++) {
+                    int ka = act[a], pa = prog[a], b = a - 1;
+                    while (b >= 0 && prog[b] > pa) {
+                        act[b+1] = act[b]; prog[b+1] = prog[b]; b--;
+                    }
+                    act[b+1] = ka; prog[b+1] = pa;
+                }
+                node_budget = (u64)1 << 60;
+                for (int i = 0; i < defer; i++) {
+                    int k = act[i];
+                    rng = seed_salt ^ ((u64)(k+1) << 16) ^ 0x5851f42d4c957f2dULL;
+                    rng ^= rng >> 33; rng *= 0xff51afd7ed558ccdULL; rng ^= rng >> 33;
+                    bool ok = solve_from(order[k]);
+                    if (dbg)
+                        fprintf(stderr, "w%d pass2 start#%d/%d pos=(%d,%d) nodes=%llu %s\n",
+                                w, k, ns, order[k] % PW - 1, order[k] / PW - 1,
+                                (unsigned long long)nodes,
+                                ok ? "SOLVED" : "dead");
+                    if (ok) {
+                        int sx = order[k] % PW - 1, sy = order[k] / PW - 1;
+                        path[pathlen] = 0;
+                        fprintf(out, "x=%d&y=%d&path=%s\n", sx, sy, path);
+                        fflush(out);
+                        _exit(0);
+                    }
+                }
+                if (nworkers == 1) printf("No solution found\n");
+                _exit(1);
+            }
+
             u64 scale = 1 + (u64)total_empty / 8;
-            u64 budgets[] = {1000, 8000, 64000, 512000, 8000000, 128000000, (u64)1<<44};
-            int ntiers = 7;
-            for (int bi = 0; bi < ntiers; bi++) {
-                node_budget = budgets[bi] * scale;
-                int alive = 0;
-                for (int k = w; k < ns; k += nworkers) {
-                    if (dead[k]) continue;
-                    alive++;
+            u64 budget = 1000;
+            for (int bi = 0; nmine > 0; bi++, budget *= 8) {
+                node_budget = budget * scale;
+                int kept = 0;
+                for (int i = 0; i < nmine; i++) {
+                    int k = act[i];
                     rng = seed_salt ^ ((u64)(w+1) << 40)
                         ^ ((u64)(k+1) << 16) ^ (u64)(bi+1);
                     rng ^= rng >> 33; rng *= 0xff51afd7ed558ccdULL; rng ^= rng >> 33;
                     bool ok = solve_from(order[k]);
-                    if (!ok && !aborted) dead[k] = 1;
                     if (dbg)
-                        fprintf(stderr, "w%d tier%d start#%d/%d pos=(%d,%d) nodes=%llu %s\n",
+                        fprintf(stderr, "w%d tier%d start#%d/%d pos=(%d,%d) nodes=%llu best=%d %s\n",
                                 w, bi, k, ns, order[k] % PW - 1, order[k] / PW - 1,
-                                (unsigned long long)nodes,
+                                (unsigned long long)nodes, best_remaining,
                                 ok ? "SOLVED" : (aborted ? "abort" : "dead"));
                     if (ok) {
                         int sx = order[k] % PW - 1, sy = order[k] / PW - 1;
@@ -701,17 +974,43 @@ int main(void)
                         fflush(out);
                         if (getenv("COIL_STATS"))
                             fprintf(stderr,
-                                "w%d stats: region_calls=%llu region_cells=%llu visits=%llu branches=%llu\n",
+                                "w%d stats: region_calls=%llu region_cells=%llu visits=%llu branches=%llu\n"
+                                "  prunes: parity=%llu struct=%llu conn=%llu lb3=%llu cyc3=%llu over=%llu feas=%llu dirs=%llu tt=%llu\n",
                                 w,
                                 (unsigned long long)st_region_calls,
                                 (unsigned long long)st_region_cells,
                                 (unsigned long long)st_visits,
-                                (unsigned long long)st_branches);
+                                (unsigned long long)st_branches,
+                                (unsigned long long)st_p_parity,
+                                (unsigned long long)st_p_struct,
+                                (unsigned long long)st_p_conn,
+                                (unsigned long long)st_p_lb3,
+                                (unsigned long long)st_p_cyc,
+                                (unsigned long long)st_p_over,
+                                (unsigned long long)st_p_feas,
+                                (unsigned long long)st_p_dirs,
+                                (unsigned long long)st_p_tt);
                         _exit(0);
                     }
+                    if (aborted) {              /* keep with its progress */
+                        act[kept] = k; prog[kept] = best_remaining; kept++;
+                    }
+                    /* exhausted (not aborted): proven dead, dropped */
                 }
-                if (alive == 0) break;
+                /* most promising first; shrink the field gradually */
+                for (int a = 1; a < kept; a++) {
+                    int ka = act[a], pa = prog[a], b = a - 1;
+                    while (b >= 0 && prog[b] > pa) {
+                        act[b+1] = act[b]; prog[b+1] = prog[b]; b--;
+                    }
+                    act[b+1] = ka; prog[b+1] = pa;
+                }
+                if (kept > 16 && bi >= 1) {
+                    kept = kept / 2 > 16 ? kept / 2 : 16;
+                }
+                nmine = kept;
             }
+            if (nworkers == 1) printf("No solution found\n");
             _exit(1);   /* no solution from this worker's starts */
         }
         kids[w] = pid;
