@@ -71,6 +71,27 @@ size of the board. Current quantified facts (level 101 profile):
   Acceptance criteria, on the fixed benchmark: level 101 from 129.5M ops
   to under 30M; level 201 solved inside 300M; no prune-rule regressions
   (same or better prune counts per branch).
+
+## Falsified designs (keep; do not retry)
+
+Both attempted to avoid full-region scans without maintaining structure.
+Measured on the fixed benchmark, fixed seed, op-counted:
+
+1. Sparser scan cadence (8x fewer scans): scan ops fell 4x, search tree
+   tripled (57k -> 150k branches on level 101), net +23% total ops.
+2. Windowed analysis (256-cell bounded Tarjan around each ray, sound
+   sealed-component + pendant-lobe claims, event-driven full scans):
+   level 101 no longer solves within 300M ops (was 129.5M); level 301
+   field clearing fell from 120 to 89 refutations per 300M ops. The
+   window's claims are sound but cannot substitute for region-global
+   block knowledge: most refutation-shortening prunes derive from
+   structure far from the last ray.
+
+Conclusion: the scan's knowledge must be kept current everywhere, at
+update cost bounded by the change. Locality of computation, yes;
+locality of knowledge, no. The windowed machinery (sound bounded-view
+classification) remains in the code (COIL_WINDOW) as a building block
+for per-block re-analysis in the incremental design.
 - Self-contained subproblems (pendant pockets behind a cut vertex) are
   decided once and cached by content; this generalizes: any state
   fragment with a provably closed boundary is a candidate for exact
