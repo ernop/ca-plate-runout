@@ -125,7 +125,7 @@ static inline void rind_del(int q)
 
 static u64 st_region_calls, st_region_cells, st_visits, st_branches;
 static u64 st_p_parity, st_p_struct, st_p_conn, st_p_lb3, st_p_cyc,
-           st_p_over, st_p_feas, st_p_dirs, st_p_tt;
+           st_p_over, st_p_feas, st_p_dirs, st_p_tt, st_p_lbpar;
 
 /* Transposition table of proven-dead states. A state is the visited set
  * (Zobrist hash, maintained incrementally) plus the head cell. Search
@@ -165,8 +165,11 @@ static inline void visit_cell(int p)
     if (!blocked[p+PW]) dec_deg(p+PW);
     vlog[vloglen++] = p;
     st_visits++;
-    for (int i = 0; i < RIND_OFF_N; i++) rind_add(p + rind_off[i]);
-    ops += 8 + RIND_OFF_N;
+    if (use_rind) {
+        for (int i = 0; i < RIND_OFF_N; i++) rind_add(p + rind_off[i]);
+        ops += RIND_OFF_N;
+    }
+    ops += 8;
     hist_visit[(remaining * 7) / (total_empty + 1)] += 8;
 }
 
@@ -183,8 +186,11 @@ static void rewind_to(int loglen, int plen)
         if (!blocked[p+PW]) inc_deg(p+PW);
         if (deg[p] == 1) nleaf++;
         else if (deg[p] == 0) nisol++;
-        for (int i = 0; i < RIND_OFF_N; i++) rind_del(p + rind_off[i]);
-        ops += 8 + RIND_OFF_N;
+        if (use_rind) {
+            for (int i = 0; i < RIND_OFF_N; i++) rind_del(p + rind_off[i]);
+            ops += RIND_OFF_N;
+        }
+        ops += 8;
     }
     pathlen = plen;
 }
@@ -499,7 +505,7 @@ static bool analyze_region(int seed, int head)
                 } else {
                     /* interior pop: all flags of this block are final */
                     sepflag[p] = 1;
-                    int cuts = 0, blkverts = 0;
+                    int cuts = 0, blkverts = 0, bbal = 0;
                     int mstart = esp;   /* re-walk range for marking */
                     for (;;) {
                         int a = estack[--esp], b = eother[esp];
@@ -507,17 +513,19 @@ static bool analyze_region(int seed, int head)
                             bcmark[a] = bcgen;
                             if (blkverts < LOBE_MAX) lb_cells[blkverts] = a;
                             blkverts++;
+                            bbal += cellcolor(a) ? -1 : 1;
                             if (sepflag[a]) cuts++;
                         }
                         if (bcmark[b] != bcgen) {
                             bcmark[b] = bcgen;
                             if (blkverts < LOBE_MAX) lb_cells[blkverts] = b;
                             blkverts++;
+                            bbal += cellcolor(b) ? -1 : 1;
                             if (sepflag[b]) cuts++;
                         }
                         if (a == u && b == p) break;
                     }
-                    if (cuts <= 1) {
+                    if (cuts <= 1 && blkverts < remaining) {
                         if (++leafblocks >= 3) { st_p_lb3++; return false; }
                         u8 bid = (u8)(leafblocks - 1);
                         for (int e = esp; e < mstart; e++) {
@@ -530,10 +538,39 @@ static bool analyze_region(int seed, int head)
                                 lbid[eother[e]] = bid;
                             }
                         }
+                        /* Parity refutation, any lobe size, entry-free:
+                         * the lobe path covers B (or B minus the cut, if
+                         * the cut is covered by an outside pass-by). An
+                         * alternating path of n cells needs balance 0
+                         * (n even) or +-1 (n odd). Both options failing
+                         * kills the state. */
+                        {
+                            int pb = cellcolor(p) ? -1 : 1;
+                            int nB = blkverts,      balB = bbal;
+                            int nP = blkverts - 1,  balP = bbal - pb;
+                            bool okB = (nB & 1) ? (balB == 1 || balB == -1)
+                                                : (balB == 0);
+                            bool okP = (nP & 1) ? (balP == 1 || balP == -1)
+                                                : (balP == 0);
+                            if (!okB && !okP) { st_p_lbpar++; return false; }
+                        }
                         /* pendant pocket: micro-refute if small */
-                        if (blkverts <= LOBE_MAX && blkverts < remaining) {
+                        if (blkverts <= LOBE_MAX) {
                             lb_n = blkverts;
                             if (!lobe_check(p, head)) return false;
+                        }
+                    } else if (cuts <= 1) {
+                        if (++leafblocks >= 3) { st_p_lb3++; return false; }
+                        u8 bid = (u8)(leafblocks - 1);
+                        for (int e = esp; e < mstart; e++) {
+                            if (!sepflag[estack[e]]) {
+                                leafmark[estack[e]] = markgen;
+                                lbid[estack[e]] = bid;
+                            }
+                            if (!sepflag[eother[e]]) {
+                                leafmark[eother[e]] = markgen;
+                                lbid[eother[e]] = bid;
+                            }
                         }
                     }
                 }
@@ -566,14 +603,27 @@ static bool analyze_region(int seed, int head)
                 }
             if (!root_cut) { leafmark[seed] = markgen; lbid[seed] = bid; }
 
-            /* pendant pocket hanging off the root: micro-refute */
             int blkverts = end - rb_start[i] + 1;   /* + seed */
-            if (root_cut && blkverts <= LOBE_MAX && blkverts < remaining) {
+            if (root_cut && blkverts < remaining) {
+                /* entry-free parity refutation (any size) */
+                int bbal = cellcolor(seed) ? -1 : 1;
                 for (int j = rb_start[i]; j < end; j++)
-                    lb_cells[j - rb_start[i]] = rbuf[j];
-                lb_cells[blkverts - 1] = seed;
-                lb_n = blkverts;
-                if (!lobe_check(seed, head)) return false;
+                    bbal += cellcolor(rbuf[j]) ? -1 : 1;
+                int pb = cellcolor(seed) ? -1 : 1;
+                int nB = blkverts,     balB = bbal;
+                int nP = blkverts - 1, balP = bbal - pb;
+                bool okB = (nB & 1) ? (balB == 1 || balB == -1) : (balB == 0);
+                bool okP = (nP & 1) ? (balP == 1 || balP == -1) : (balP == 0);
+                if (!okB && !okP) { st_p_lbpar++; return false; }
+
+                /* pendant pocket hanging off the root: micro-refute */
+                if (blkverts <= LOBE_MAX) {
+                    for (int j = rb_start[i]; j < end; j++)
+                        lb_cells[j - rb_start[i]] = rbuf[j];
+                    lb_cells[blkverts - 1] = seed;
+                    lb_n = blkverts;
+                    if (!lobe_check(seed, head)) return false;
+                }
             }
         }
     }
@@ -807,6 +857,7 @@ static void print_stats(void)
         (unsigned long long)st_p_feas,
         (unsigned long long)st_p_dirs,
         (unsigned long long)st_p_tt);
+    fprintf(stderr, "  lbpar=%llu\n", (unsigned long long)st_p_lbpar);
     fprintf(stderr, "  lobes: solves=%llu hits=%llu prunes=%llu\n",
         (unsigned long long)st_lobe_solves,
         (unsigned long long)st_lobe_hits,
