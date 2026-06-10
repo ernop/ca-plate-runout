@@ -115,6 +115,26 @@ for per-block re-analysis in the incremental design.
   children without their own subtree-root scan: scan count divided by
   the effective branching factor, claims unchanged, soundness from the
   parent certificate plus the window lemmas.
+
+## Sound rules added, inert or net-negative at benchmark scale
+
+Kept in the code for re-evaluation on larger boards; each is proven
+sound against exhaustive ground truth:
+
+- Entry-free lobe parity (any lobe size): an alternating path of n
+  cells needs color balance 0 (n even) or +-1 (n odd); a pendant lobe
+  failing both its B and B-minus-cut variants is dead. Zero fires on
+  benchmark levels (on by default, zero cost: computed in the pop walk).
+- Chain-interior block refutation (COIL_CHAIN, default off): a 2-cut
+  block with cells beyond both cuts and no head adjacency must admit a
+  through-traversal or a one-cut full cover with the other cut optional;
+  all modes content-cached. ~1% net ops loss at <=104x102 because
+  through-traversals are rarely impossible at that scale.
+
+The pattern across all additions: at benchmark scale the search is
+limited by full-region scan cost, not by missing claim types. Larger
+boards shift the balance (more corridor structure, bigger pockets);
+re-measure the gated rules when the benchmark gains a 500+ level.
 - Self-contained subproblems (pendant pockets behind a cut vertex) are
   decided once and cached by content; this generalizes: any state
   fragment with a provably closed boundary is a candidate for exact

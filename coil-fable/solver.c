@@ -262,12 +262,19 @@ static int  lb_micro_nodes;
 /* verdict cache: key -> feasible / infeasible */
 #define LOBE_TT_BITS 20
 static u64 *lobe_feas, *lobe_infeas;
-static u64 st_lobe_solves, st_lobe_hits, st_p_lobe;
+static u64 st_lobe_solves, st_lobe_hits, st_p_lobe, st_p_chain;
+static bool use_chain;      /* sound; ~1% net ops loss at <=104x102:
+                               through-traversals are rarely impossible
+                               at benchmark scale. Re-evaluate on larger
+                               boards where corridor chains multiply. */
+
+static int lb_end = -1;     /* required final slot (-1 = anywhere) */
 
 static bool lobe_dfs(u64 mask, int p)
 {
     ops += 6;
-    if ((mask & lb_need) == lb_need) return true;
+    if ((mask & lb_need) == lb_need && (lb_end < 0 || p == lb_end))
+        return true;
     if (++lb_micro_nodes > LOBE_NODE_CAP) return true; /* unknown: no prune */
     for (int d = 0; d < 4; d++) {
         int q = lb_nbr[p][d];
@@ -335,6 +342,81 @@ static u64 lobe_build(void)
     }
     lb_full = (lb_n >= 64) ? ~(u64)0 : (((u64)1 << lb_n) - 1);
     return h;
+}
+
+/* micro-search helper: start at slot s (path occupies it), slide d,
+ * then free search; cached by (content ^ salt). */
+static bool lobe_mode(u64 chash, u64 salt, int s, int d)
+{
+    u64 key = chash ^ salt;
+    key ^= key >> 29; key *= 0x9e3779b97f4a7c15ULL; key ^= key >> 32;
+    u32 idx = (u32)(key >> (64 - LOBE_TT_BITS));
+    if (lobe_feas[idx] == key)   { st_lobe_hits++; return true; }
+    if (lobe_infeas[idx] == key) { st_lobe_hits++; return false; }
+    u64 mask = (u64)1 << s;
+    int r = s;
+    for (;;) {
+        int nx = lb_nbr[r][d];
+        if (nx < 0 || (mask >> nx) & 1) break;
+        r = nx; mask |= (u64)1 << r;
+    }
+    lb_micro_nodes = 0;
+    st_lobe_solves++;
+    bool ok = lobe_dfs(mask, r);
+    bool capped = lb_micro_nodes > LOBE_NODE_CAP;
+    if (!capped) {
+        if (ok) lobe_feas[idx] = key; else lobe_infeas[idx] = key;
+    }
+    return ok || capped;
+}
+
+/*
+ * Chain-interior block B with exactly two cut vertices c1, c2 and cells
+ * beyond both: the path must either traverse B through (enter one cut,
+ * cover everything, leave by the other) or place BOTH global endpoints
+ * inside B. If the head is not adjacent to any B cell, the next-entered
+ * endpoint cannot be in B, so only: through, or one excursion from a cut
+ * covering everything (other cut coverable by an outside pass-by) and
+ * ending inside (the final endpoint). All modes impossible => dead.
+ * Verdicts depend only on (B, c1, c2): content-cached.
+ */
+static bool chain_check(int c1, int c2, int head)
+{
+    u64 chash = lobe_build() ^ zheadkey[c1] ^ (zheadkey[c2] * 3);
+    int s1 = (int)lobeslot[c1], s2 = (int)lobeslot[c2];
+
+    if (head >= 0) {
+        for (int d = 0; d < 4; d++) {
+            int nb = head + DELTA[d];
+            if (!blocked[nb] && lobemark[nb] == lobegen) return true;
+        }
+    }
+
+    /* through c1 -> c2 and c2 -> c1: full coverage, fixed final cell */
+    lb_need = lb_full;
+    for (int pass = 0; pass < 2; pass++) {
+        int sa = pass ? s2 : s1, sb = pass ? s1 : s2;
+        lb_end = sb;
+        for (int d = 0; d < 4; d++) {
+            if (lb_nbr[sa][d] < 0) continue;
+            if (lobe_mode(chash, (u64)(pass*41 + d*7 + 11) * 0x165667b19e3779f9ULL,
+                          sa, d)) { lb_end = -1; return true; }
+        }
+    }
+    lb_end = -1;
+
+    /* one excursion from a cut, other cut optional, end anywhere */
+    for (int pass = 0; pass < 2; pass++) {
+        int sa = pass ? s2 : s1, sb = pass ? s1 : s2;
+        lb_need = lb_full & ~((u64)1 << sb);
+        for (int d = 0; d < 4; d++) {
+            if (lb_nbr[sa][d] < 0) continue;
+            if (lobe_mode(chash, (u64)(pass*43 + d*13 + 401) * 0xc2b2ae3d27d4eb4fULL,
+                          sa, d)) return true;
+        }
+    }
+    st_p_chain++;
+    return false;
 }
 
 /*
@@ -505,7 +587,7 @@ static bool analyze_region(int seed, int head)
                 } else {
                     /* interior pop: all flags of this block are final */
                     sepflag[p] = 1;
-                    int cuts = 0, blkverts = 0, bbal = 0;
+                    int cuts = 0, blkverts = 0, bbal = 0, c_other = -1;
                     int mstart = esp;   /* re-walk range for marking */
                     for (;;) {
                         int a = estack[--esp], b = eother[esp];
@@ -514,16 +596,21 @@ static bool analyze_region(int seed, int head)
                             if (blkverts < LOBE_MAX) lb_cells[blkverts] = a;
                             blkverts++;
                             bbal += cellcolor(a) ? -1 : 1;
-                            if (sepflag[a]) cuts++;
+                            if (sepflag[a]) { cuts++; if (a != p) c_other = a; }
                         }
                         if (bcmark[b] != bcgen) {
                             bcmark[b] = bcgen;
                             if (blkverts < LOBE_MAX) lb_cells[blkverts] = b;
                             blkverts++;
                             bbal += cellcolor(b) ? -1 : 1;
-                            if (sepflag[b]) cuts++;
+                            if (sepflag[b]) { cuts++; if (b != p) c_other = b; }
                         }
                         if (a == u && b == p) break;
+                    }
+                    if (use_chain && cuts == 2 && c_other >= 0 &&
+                        blkverts <= LOBE_MAX && blkverts < remaining) {
+                        lb_n = blkverts;
+                        if (!chain_check(p, c_other, head)) return false;
                     }
                     if (cuts <= 1 && blkverts < remaining) {
                         if (++leafblocks >= 3) { st_p_lb3++; return false; }
@@ -857,7 +944,9 @@ static void print_stats(void)
         (unsigned long long)st_p_feas,
         (unsigned long long)st_p_dirs,
         (unsigned long long)st_p_tt);
-    fprintf(stderr, "  lbpar=%llu\n", (unsigned long long)st_p_lbpar);
+    fprintf(stderr, "  lbpar=%llu chain=%llu\n",
+        (unsigned long long)st_p_lbpar,
+        (unsigned long long)st_p_chain);
     fprintf(stderr, "  lobes: solves=%llu hits=%llu prunes=%llu\n",
         (unsigned long long)st_lobe_solves,
         (unsigned long long)st_lobe_hits,
@@ -1629,6 +1718,7 @@ int main(void)
     use_window = getenv("COIL_WINDOW") != NULL;
     use_rind = getenv("COIL_RIND") != NULL;   /* falsified: distance-2 rind
                                                  misses pocket-scale structure */
+    use_chain = getenv("COIL_CHAIN") != NULL;
     if (getenv("COIL_SEED"))
         seed_salt ^= (u64)strtoull(getenv("COIL_SEED"), NULL, 10) * 0xc2b2ae3d27d4eb4fULL;
     else
