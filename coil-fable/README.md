@@ -64,15 +64,20 @@ Per-node machinery:
 
 ## Results
 
-Scores on the coilbench progression (600s/level, 4-core VM):
+Scores on the coilbench progression (official `evaluate_full.py`, odd+even
+levels, 600s/level, 4-core VM):
 
 | Solver generation | Highest level | Notes |
 | --- | --- | --- |
-| v1 naive DFS + parity/connectivity | 83 | 10s timeout |
-| v2 + leaf/isolated counters | 137 | 10s timeout |
-| v3 + lookahead, budget tiers, 4 workers | 175 | 60s timeout |
-| v6 + leaf-block pruning, endpoint targeting | 233+ | 600s timeout |
-| v9 + tier tuning, check gating, counter fold | 261+ | 600s timeout |
+| v1 naive DFS + parity/connectivity | 83 | 10s timeout, odd only |
+| v2 + leaf/isolated counters | 137 | 10s timeout, odd only |
+| v3 + lookahead, budget tiers, 4 workers | 175 | 60s timeout, odd only |
+| v6 + leaf-block pruning, endpoint targeting | 233 | 600s, odd only |
+| v9 + tier tuning, check gating, counter fold | 262 | official full run |
+| v10 + worker cadence diversity, -O3 | 269 | official full run |
+| v11 + time-based restart seeds | **276** | official full run |
 
 Reference scores from `results.md` in the benchmark repo: GPT-5.3-codex 117,
-GPT-5.5 163, Gemini 3 195, kimi 2.6 264.
+GPT-5.5 163, Gemini 3 195, kimi 2.6 264 (previous best). For human context
+(hacker.org Mortal Coil): >200 people passed level 100, 47 passed level 300,
+4 finished all levels.
