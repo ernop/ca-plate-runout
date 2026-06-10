@@ -57,7 +57,7 @@ static u64 nodes;
 static u64 node_budget;
 static bool aborted;
 static int dirperm[4] = {0, 1, 2, 3};   /* per-worker direction priority */
-static bool use_forced;     /* forced-edge deficit pruning (off: net loss) */
+static bool use_forced;     /* forced-edge deficit pruning */
 
 static u32 *mark;
 static u32 markgen;
@@ -65,21 +65,60 @@ static u32 markgen;
 static inline int cellcolor(int p) { return ((p % PW) + (p / PW)) & 1; }
 static inline bool free_cell(int p) { return !blocked[p]; }
 
+/*
+ * Forced-edge accounting (incremental): a free cell v with deg==2 must
+ * use both incident edges unless it is one of the path's 2 endpoints.
+ * cnt2[x] = number of free deg-2 neighbors of x ("forced edges into x").
+ * A free x carries at most 2 path edges, so each unit of cnt2[x] above 2
+ * must be paid for by spending an endpoint at one of x's forcers.
+ * deficit = sum over free x of max(0, cnt2[x]-2); deficit > 2 => dead.
+ */
+static u8  *cnt2;
+static int deficit;
+
+static inline void add_forcer(int v)
+{
+    if (!use_forced) return;
+    int x;
+    x = v-1;  if (++cnt2[x] > 2 && !blocked[x]) deficit++;
+    x = v+1;  if (++cnt2[x] > 2 && !blocked[x]) deficit++;
+    x = v-PW; if (++cnt2[x] > 2 && !blocked[x]) deficit++;
+    x = v+PW; if (++cnt2[x] > 2 && !blocked[x]) deficit++;
+}
+static inline void del_forcer(int v)
+{
+    if (!use_forced) return;
+    int x;
+    x = v-1;  if (cnt2[x]-- > 2 && !blocked[x]) deficit--;
+    x = v+1;  if (cnt2[x]-- > 2 && !blocked[x]) deficit--;
+    x = v-PW; if (cnt2[x]-- > 2 && !blocked[x]) deficit--;
+    x = v+PW; if (cnt2[x]-- > 2 && !blocked[x]) deficit--;
+}
+
 static inline void dec_deg(int p)
 {
+    u8 d0 = deg[p];
+    if (d0 == 2) del_forcer(p);
     u8 d = --deg[p];
-    if (d == 1) nleaf++;
+    if (d == 2) add_forcer(p);
+    else if (d == 1) nleaf++;
     else if (d == 0) { nleaf--; nisol++; }
 }
 static inline void inc_deg(int p)
 {
+    u8 d0 = deg[p];
+    if (d0 == 2) del_forcer(p);
     u8 d = ++deg[p];
-    if (d == 1) { nisol--; nleaf++; }
-    else if (d == 2) nleaf--;
+    if (d == 2) { add_forcer(p); nleaf--; }
+    else if (d == 1) { nisol--; nleaf++; }
 }
 
 static inline void visit_cell(int p)
 {
+    if (use_forced) {
+        if (deg[p] == 2) del_forcer(p);          /* p stops forcing */
+        if (cnt2[p] > 2) deficit -= cnt2[p] - 2; /* p's overload term leaves */
+    }
     blocked[p] = 1; remaining--;
     colorbal += cellcolor(p) ? 1 : -1;
     /* p leaves the free set: remove its own leaf/isol contribution */
@@ -96,14 +135,18 @@ static void rewind_to(int loglen, int plen)
 {
     while (vloglen > loglen) {
         int p = vlog[--vloglen];
-        blocked[p] = 0; remaining++;
-        colorbal += cellcolor(p) ? -1 : 1;
         if (!blocked[p-1])  inc_deg(p-1);
         if (!blocked[p+1])  inc_deg(p+1);
         if (!blocked[p-PW]) inc_deg(p-PW);
         if (!blocked[p+PW]) inc_deg(p+PW);
+        blocked[p] = 0; remaining++;
+        colorbal += cellcolor(p) ? -1 : 1;
         if (deg[p] == 1) nleaf++;
         else if (deg[p] == 0) nisol++;
+        if (use_forced) {
+            if (cnt2[p] > 2) deficit += cnt2[p] - 2;
+            if (deg[p] == 2) add_forcer(p);
+        }
     }
     pathlen = plen;
 }
@@ -136,8 +179,6 @@ static u32 bcgen;
 static s32 *rbuf;            /* deferred root-block vertex lists */
 static u32 *leafmark;        /* cell is valid endpoint (interior of a leaf
                                 block); generation = markgen of the call */
-static u8  *fdeg;            /* forced path-degree from deg-2 neighbors */
-static u32 *fmark;           /* generation guard for fdeg */
 
 static int last_leafblocks;  /* result of the most recent region_ok */
 static u32 last_region_gen;
@@ -164,7 +205,6 @@ static bool region_ok(int pos)
     int root_children = 0;
     int rb_start[5], rb_cuts[5], nrb = 0;   /* root blocks (<=4) */
     int rbn = 0;
-    int deficit = 0;    /* forced path-degree overload, max 2 fixable */
 
     tstack[0] = seed; tdirs[0] = 0; tparent[0] = -1;
     mark[seed] = markgen;
@@ -172,28 +212,6 @@ static bool region_ok(int pos)
     sepflag[seed] = 0;
     int top = 1;
 
-    /*
-     * Forced-edge accounting: a free cell with exactly 2 free neighbors
-     * must use both incident edges unless it is one of the path's 2
-     * endpoints. Each endpoint placed at such a cell relaxes one forced
-     * edge. A cell x can carry at most 2 path edges, so any forced count
-     * beyond 2 must be paid for by an endpoint; total budget is 2.
-     */
-#define FORCE_FROM(v)                                                     \
-    do {                                                                  \
-        if (use_forced && deg[v] == 2) {                                  \
-            for (int _i = 0; _i < 4; _i++) {                              \
-                int _x = (v) + DELTA[_i];                                 \
-                if (!free_cell(_x)) continue;                             \
-                if (fmark[_x] != markgen) { fmark[_x] = markgen; fdeg[_x] = 0; } \
-                if (++fdeg[_x] > 2) {                                     \
-                    if (++deficit > 2) return false;                      \
-                }                                                         \
-            }                                                             \
-        }                                                                 \
-    } while (0)
-
-    FORCE_FROM(seed);
 
     while (top > 0) {
         int u = tstack[top-1];
@@ -214,7 +232,6 @@ static bool region_ok(int pos)
             disc[v] = low[v] = ++counter;
             sepflag[v] = 0;
             cnt++;
-            FORCE_FROM(v);
             estack[esp] = v; eother[esp] = u; esp++;   /* tree edge */
             tstack[top] = v; tdirs[top] = 0; tparent[top] = u;
             top++;
@@ -314,6 +331,7 @@ static inline bool struct_ok(int pos)
     if (remaining == 0) return true;
     if (nleaf > 2) return false;
     if (nisol > 1) return false;
+    if (use_forced && deficit > 2) return false;
     if (nisol == 1) {
         /* lone isolated cell must be adjacent to head (it can only be the
          * final cell, entered directly from pos) */
@@ -493,8 +511,7 @@ int main(void)
     bcmark  = calloc(NCELLS, sizeof(u32));
     rbuf    = malloc((size_t)NCELLS * sizeof(s32));
     leafmark = calloc(NCELLS, sizeof(u32));
-    fdeg    = calloc(NCELLS, 1);
-    fmark   = calloc(NCELLS, sizeof(u32));
+    cnt2    = calloc(NCELLS, 1);
 
     memset(blocked, 1, NCELLS);
     total_empty = 0;
@@ -520,6 +537,13 @@ int main(void)
         if (d == 1) nleaf++;
         else if (d == 0) nisol++;
     }
+    deficit = 0;
+    for (int p = 0; p < NCELLS; p++) {
+        if (blocked[p] || deg[p] != 2) continue;
+        cnt2[p-1]++; cnt2[p+1]++; cnt2[p-PW]++; cnt2[p+PW]++;
+    }
+    for (int p = 0; p < NCELLS; p++)
+        if (!blocked[p] && cnt2[p] > 2) deficit += cnt2[p] - 2;
 
     pathlen = 0; vloglen = 0;
 
@@ -566,7 +590,7 @@ int main(void)
 
     bool dbg = getenv("COIL_DEBUG") != NULL;
     always_check = getenv("COIL_LAZY_CHECK") == NULL;  /* default: always */
-    use_forced = getenv("COIL_FORCED") != NULL;
+    use_forced = getenv("COIL_FORCED") != NULL;        /* default: off */
     int nworkers = 4;
     {
         const char *env = getenv("COIL_WORKERS");
