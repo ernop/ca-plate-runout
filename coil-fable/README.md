@@ -81,3 +81,32 @@ Reference scores from `results.md` in the benchmark repo: GPT-5.3-codex 117,
 GPT-5.5 163, Gemini 3 195, kimi 2.6 264 (previous best). For human context
 (hacker.org Mortal Coil): >200 people passed level 100, 47 passed level 300,
 4 finished all levels.
+
+## Single-thread era (v12+)
+
+Under a stricter discipline (one thread, 60s per level), the solver was
+rebuilt around a key empirical discovery: **winning start cells are rare**
+(often literally one cell out of thousands; exhaustive enumeration on small
+levels shows 0.7-4.5% winner density, spatially clustered), while dead
+starts are cheap to *disprove* with strong pruning. That inverted the
+architecture:
+
+- **Transposition table** (16M entries): a state is the visited-set Zobrist
+  hash plus head cell; fully-explored dead states are remembered, so search
+  orders that permute into the same coverage collapse to one subtree, and
+  re-visits across passes/starts are free.
+- **Two-pass exhaustive sweep** replaced randomized restart tiers: pass 1
+  visits every start with a budget sized to observed winner costs (winners
+  solve within a few thousand branch nodes); the rare expensive dead trees
+  are deferred and exhausted in pass 2, deepest-progress first. The sweep
+  is deterministic and complete - the true solution can never be skipped.
+- **Forced-edge engine** in the region pass: degree-2 cells force both
+  incident edges; forced components are segments and cycles. Each forced
+  cycle demands a path endpoint on it, leaf blocks demand endpoints inside
+  them, and only two endpoints exist - infeasible demand patterns prune.
+- Optional greedy-probe pass (one backtrack-free descent per start) ranks
+  starts by reachable depth before the sweep.
+
+Single-thread 60s frontier: **207** (vs 195 for the restart-roulette
+architecture on 4 workers, and 117-264 for the multi-model reference rows
+at 600s on multiple cores).

@@ -500,6 +500,27 @@ static inline int sim_slide(int pos, int d, int *len, int *endopts)
     return pos;
 }
 
+static void print_stats(void)
+{
+    if (!getenv("COIL_STATS")) return;
+    fprintf(stderr,
+        "stats: region_calls=%llu region_cells=%llu visits=%llu branches=%llu\n"
+        "  prunes: parity=%llu struct=%llu conn=%llu lb3=%llu cyc3=%llu over=%llu feas=%llu dirs=%llu tt=%llu\n",
+        (unsigned long long)st_region_calls,
+        (unsigned long long)st_region_cells,
+        (unsigned long long)st_visits,
+        (unsigned long long)st_branches,
+        (unsigned long long)st_p_parity,
+        (unsigned long long)st_p_struct,
+        (unsigned long long)st_p_conn,
+        (unsigned long long)st_p_lb3,
+        (unsigned long long)st_p_cyc,
+        (unsigned long long)st_p_over,
+        (unsigned long long)st_p_feas,
+        (unsigned long long)st_p_dirs,
+        (unsigned long long)st_p_tt);
+}
+
 static bool dfs(int pos)
 {
     for (;;) {
@@ -568,8 +589,14 @@ static bool dfs(int pos)
         u32 ttidx = (u32)((ttkey * 0x9e3779b97f4a7c15ULL) >> (64 - TT_BITS));
         if (tt[ttidx] == ttkey) { st_p_tt++; return false; }
 
+        /* Region analysis cadence scales with region size: a scan costs
+         * O(remaining), so near the root (huge region, weak structure)
+         * scan sparsely; deep down (small region, dense structure) scan
+         * every branch node, where scans are cheap and prunes are likely. */
         bool fresh_region = false;
-        if ((dirty_conn || always_check) && (++checktick & checkmask) == 0) {
+        u32 cadence = (u32)(remaining >> 9);
+        if ((dirty_conn || always_check) &&
+            (cadence == 0 || (++checktick % (cadence + 1)) == 0)) {
             if (!region_ok(pos)) return false;
             dirty_conn = false;
             fresh_region = true;
@@ -948,6 +975,7 @@ int main(void)
                         path[pathlen] = 0;
                         fprintf(out, "x=%d&y=%d&path=%s\n", sx, sy, path);
                         fflush(out);
+                        print_stats();
                         _exit(0);
                     }
                     if (anyalive) {
@@ -983,6 +1011,7 @@ int main(void)
                             path[pathlen] = 0;
                             fprintf(out, "x=%d&y=%d&path=%s\n", sx, sy, path);
                             fflush(out);
+                            print_stats();
                             _exit(0);
                         }
                         if (aborted) {
@@ -992,6 +1021,7 @@ int main(void)
                     alive = kept;
                 }
                 if (nworkers == 1) printf("No solution found\n");
+                print_stats();
                 _exit(1);
             }
 
