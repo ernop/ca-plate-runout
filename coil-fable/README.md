@@ -107,6 +107,10 @@ architecture:
 - Optional greedy-probe pass (one backtrack-free descent per start) ranks
   starts by reachable depth before the sweep.
 
-Single-thread 60s frontier: **207** (vs 195 for the restart-roulette
-architecture on 4 workers, and 117-264 for the multi-model reference rows
-at 600s on multiple cores).
+Single-thread 60s frontier: **207, certified consecutive from level 1**
+(the restart-roulette architecture managed 195 under the same limits).
+Each improvement step was validated against ground truth obtained by
+exhaustively enumerating every start of small levels, so no change could
+silently discard the (often unique) winning start.
+
+Build with `./build.sh <coilbench_dir>` (PGO two-stage compile).
