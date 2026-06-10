@@ -32,6 +32,7 @@
 #include <sys/select.h>
 
 typedef uint8_t  u8;
+typedef uint16_t u16;
 typedef uint32_t u32;
 typedef int32_t  s32;
 typedef uint64_t u64;
@@ -86,6 +87,41 @@ static bool ops_out;         /* op budget exhausted: stop everything */
 
 /* where do ops go, by depth? bucket = 8*remaining/total (7=near start) */
 static u64 hist_region[8], hist_visit[8], hist_branch[8];
+static u64 hist_rcall[8], hist_rprune[8], hist_pconn[8];
+
+/*
+ * Active rind: free cells within Manhattan distance <= 2 of any visited
+ * cell - the only place where carving can create new cut/block structure
+ * (plus the static structure of the virgin board, known from the initial
+ * analysis). Maintained by reference counting: every visit increments the
+ * count of the 12 cells around it, every unvisit decrements; membership
+ * is rindcnt > 0. A swap-delete list gives O(rind) enumeration.
+ */
+static u16 *rindcnt;
+static s32 *rindlist;        /* cells with rindcnt > 0 */
+static s32 *rindidx;         /* cell -> position in rindlist, or -1 */
+static int  nrind;
+static bool use_rind;
+static const int RIND_OFF_N = 12;
+static s32 rind_off[12];     /* filled in main once PW is known */
+
+static inline void rind_add(int q)
+{
+    if (rindcnt[q]++ == 0) {
+        rindidx[q] = nrind;
+        rindlist[nrind++] = q;
+    }
+}
+static inline void rind_del(int q)
+{
+    if (--rindcnt[q] == 0) {
+        int i = rindidx[q];
+        int last = rindlist[--nrind];
+        rindlist[i] = last;
+        rindidx[last] = i;
+        rindidx[q] = -1;
+    }
+}
 
 static u64 st_region_calls, st_region_cells, st_visits, st_branches;
 static u64 st_p_parity, st_p_struct, st_p_conn, st_p_lb3, st_p_cyc,
@@ -129,7 +165,8 @@ static inline void visit_cell(int p)
     if (!blocked[p+PW]) dec_deg(p+PW);
     vlog[vloglen++] = p;
     st_visits++;
-    ops += 8;
+    for (int i = 0; i < RIND_OFF_N; i++) rind_add(p + rind_off[i]);
+    ops += 8 + RIND_OFF_N;
     hist_visit[(remaining * 7) / (total_empty + 1)] += 8;
 }
 
@@ -146,7 +183,8 @@ static void rewind_to(int loglen, int plen)
         if (!blocked[p+PW]) inc_deg(p+PW);
         if (deg[p] == 1) nleaf++;
         else if (deg[p] == 0) nisol++;
-        ops += 8;
+        for (int i = 0; i < RIND_OFF_N; i++) rind_del(p + rind_off[i]);
+        ops += 8 + RIND_OFF_N;
     }
     pathlen = plen;
 }
@@ -507,7 +545,11 @@ static bool analyze_region(int seed, int head)
     st_region_calls++; st_region_cells += cnt;
     ops += (u64)cnt * 6;
     hist_region[(remaining * 7) / (total_empty + 1)] += (u64)cnt * 6;
-    if (cnt != remaining) { st_p_conn++; return false; }
+    if (cnt != remaining) {
+        st_p_conn++;
+        hist_pconn[(remaining * 7) / (total_empty + 1)]++;
+        return false;
+    }
 
     /* classify deferred root blocks */
     bool root_cut = root_children >= 2;
@@ -778,6 +820,15 @@ static void print_stats(void)
     fprintf(stderr, "\n  hist_branch:");
     for (int i = 7; i >= 0; i--)
         fprintf(stderr, " %llu", (unsigned long long)hist_branch[i]);
+    fprintf(stderr, "\n  hist_rcall:");
+    for (int i = 7; i >= 0; i--)
+        fprintf(stderr, " %llu", (unsigned long long)hist_rcall[i]);
+    fprintf(stderr, "\n  hist_rprune:");
+    for (int i = 7; i >= 0; i--)
+        fprintf(stderr, " %llu", (unsigned long long)hist_rprune[i]);
+    fprintf(stderr, "\n  hist_pconn:");
+    for (int i = 7; i >= 0; i--)
+        fprintf(stderr, " %llu", (unsigned long long)hist_pconn[i]);
     fprintf(stderr, "\n");
 }
 
@@ -983,6 +1034,177 @@ static bool window_analyze(int head)
 }
 
 
+/*
+ * Rind scan: the full scan's claims, at cost proportional to the carved
+ * neighborhood. New cut/block structure can only exist in the rind (the
+ * virgin remainder keeps the initial board's structure, verified once at
+ * startup); so Tarjan runs over rind cells only, rooted at cells adjacent
+ * to the virgin interior (boundary, no claims), and:
+ *   - a rind component with no virgin attachment is a true component:
+ *     dead if smaller than the region
+ *   - a leaf block with no boundary contact is a true pendant lobe:
+ *     micro-refuted via the content cache; >= 3 disjoint: dead
+ * Global connectivity, when in doubt (dirty), is a cheap flood (2 ops
+ * per cell) instead of a Tarjan (6 ops per cell).
+ */
+static u64 st_rind_calls, st_rind_cells, st_p_rindseal, st_p_rindlobe;
+
+static bool rind_ok(int head)
+{
+    st_rind_calls++;
+    markgen++;
+    u32 cgen = markgen;          /* component sweep marker in mark[] */
+    int scanned = 0;
+    for (int li = 0; li < nrind; li++) {
+        int s0 = rindlist[li];
+        if (s0 < 0 || s0 >= NCELLS || blocked[s0]) continue;
+        if (mark[s0] == cgen) continue;
+        /* flood this rind component; find a boundary (virgin-adjacent) root */
+        int top = 0, csz = 0, root = -1;
+        tstack[top++] = s0; mark[s0] = cgen;
+        while (top) {
+            int q = tstack[--top];
+            csz++;
+            for (int d = 0; d < 4; d++) {
+                int nb = q + DELTA[d];
+                if (blocked[nb]) continue;
+                if (rindcnt[nb] == 0) { if (root < 0) root = q; continue; }
+                if (mark[nb] != cgen) { mark[nb] = cgen; tstack[top++] = nb; }
+            }
+        }
+        scanned += csz;
+        if (root < 0) {
+            if (csz < remaining) { st_p_rindseal++; ops += (u64)scanned*8; return false; }
+            root = s0;           /* rind covers the whole region */
+        }
+
+        /* Tarjan rooted at boundary: root blocks make no claims */
+        u32 base = dctr + 1;
+        u32 counter = dctr;
+        if (dctr > 0xF0000000u) {
+            memset(disc, 0, (size_t)NCELLS * sizeof(u32));
+            dctr = 0; base = 1; counter = 0;
+        }
+        dctr += (u32)csz + 1;
+        int esp = 0, lobes = 0;
+        tstack[0] = root; tdirs[0] = 0; tparent[0] = -1;
+        disc[root] = low[root] = ++counter;
+        sepflag[root] = 0;
+        top = 1;
+        while (top > 0) {
+            int u = tstack[top-1];
+            u8 di = tdirs[top-1];
+            if (di < 4) {
+                tdirs[top-1]++;
+                int v = u + DELTA[di];
+                if (blocked[v] || rindcnt[v] == 0 || v == tparent[top-1])
+                    continue;
+                if (disc[v] >= base) {
+                    if (disc[v] < disc[u]) {
+                        estack[esp] = v; eother[esp] = u; esp++;
+                        if (disc[v] < low[u]) low[u] = disc[v];
+                    }
+                    continue;
+                }
+                disc[v] = low[v] = ++counter;
+                sepflag[v] = 0;
+                estack[esp] = v; eother[esp] = u; esp++;
+                tstack[top] = v; tdirs[top] = 0; tparent[top] = u;
+                top++;
+            } else {
+                top--;
+                int pp = tparent[top];
+                if (pp < 0) break;
+                if (low[u] < low[pp]) low[pp] = low[u];
+                if (low[u] >= disc[pp]) {
+                    bcgen++;
+                    if (pp == root) {
+                        for (;;) {
+                            int a = estack[--esp], b = eother[esp];
+                            if (a == u && b == pp) break;
+                        }
+                    } else {
+                        sepflag[pp] = 1;
+                        int cuts = 0, bnd = 0, bv = 0;
+                        for (;;) {
+                            int a = estack[--esp], b = eother[esp];
+                            if (bcmark[a] != bcgen) {
+                                bcmark[a] = bcgen;
+                                if (bv < LOBE_MAX) lb_cells[bv] = a;
+                                bv++;
+                                if (sepflag[a]) cuts++;
+                                else {
+                                    for (int d = 0; d < 4; d++) {
+                                        int nb = a + DELTA[d];
+                                        if (!blocked[nb] && rindcnt[nb] == 0)
+                                            { bnd++; break; }
+                                    }
+                                }
+                            }
+                            if (bcmark[b] != bcgen) {
+                                bcmark[b] = bcgen;
+                                if (bv < LOBE_MAX) lb_cells[bv] = b;
+                                bv++;
+                                if (sepflag[b]) cuts++;
+                                else {
+                                    for (int d = 0; d < 4; d++) {
+                                        int nb = b + DELTA[d];
+                                        if (!blocked[nb] && rindcnt[nb] == 0)
+                                            { bnd++; break; }
+                                    }
+                                }
+                            }
+                            if (a == u && b == pp) break;
+                        }
+                        if (cuts <= 1 && bnd == 0 && bv < remaining) {
+                            if (++lobes >= 3) {
+                                st_p_rindlobe++;
+                                ops += (u64)scanned * 8;
+                                return false;
+                            }
+                            if (bv <= LOBE_MAX) {
+                                lb_n = bv;
+                                if (!lobe_check(pp, head)) {
+                                    st_p_rindlobe++;
+                                    ops += (u64)scanned * 8;
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    st_rind_cells += scanned;
+    ops += (u64)scanned * 8;
+
+    /* connectivity, only when a slide left it in doubt: cheap flood */
+    if (dirty_conn) {
+        int seed = -1;
+        if      (!blocked[head-1])  seed = head-1;
+        else if (!blocked[head+1])  seed = head+1;
+        else if (!blocked[head-PW]) seed = head-PW;
+        else if (!blocked[head+PW]) seed = head+PW;
+        if (seed < 0) return false;
+        markgen++;
+        int top = 0, cnt = 1;
+        tstack[top++] = seed; mark[seed] = markgen;
+        while (top) {
+            int q = tstack[--top];
+            for (int d = 0; d < 4; d++) {
+                int nb = q + DELTA[d];
+                if (blocked[nb] || mark[nb] == markgen) continue;
+                mark[nb] = markgen; tstack[top++] = nb; cnt++;
+            }
+        }
+        ops += (u64)cnt * 2;
+        if (cnt != remaining) { st_p_conn++; return false; }
+        dirty_conn = false;
+    }
+    return true;
+}
+
 static bool dfs(int pos)
 {
     for (;;) {
@@ -1068,9 +1290,18 @@ static bool dfs(int pos)
         u32 cadence = (u32)(remaining >> 9);
         if ((dirty_conn || always_check) &&
             (cadence == 0 || (++checktick % (cadence + 1)) == 0)) {
-            if (!region_ok(pos)) return false;
-            dirty_conn = false;
-            fresh_region = true;
+            int hb = (remaining * 7) / (total_empty + 1);
+            hist_rcall[hb]++;
+            /* rind scan while the carved area is a small part of the
+             * region; full scan (more claims, same cost) once the rind
+             * approaches the region size */
+            if (use_rind && (u64)nrind * 2 < (u64)remaining * 3) {
+                if (!rind_ok(pos)) { hist_rprune[hb]++; return false; }
+            } else {
+                if (!region_ok(pos)) { hist_rprune[hb]++; return false; }
+                dirty_conn = false;
+                fresh_region = true;
+            }
         }
 
         /* The next entered cell is a path endpoint. With exactly 2 leaf
@@ -1187,6 +1418,23 @@ int main(void)
     winmark = calloc(NCELLS, sizeof(u32));
     wbound  = calloc(NCELLS, 1);
     winlist = malloc(((size_t)WINCAP + 8) * sizeof(s32));
+    {
+        /* rind arrays carry 2-row slack: distance-2 offsets from border
+         * cells land outside the padded board but inside the slack */
+        size_t slack = (size_t)2 * PW;
+        u16 *rc = calloc(NCELLS + 2 * slack, sizeof(u16));
+        s32 *ri = malloc((NCELLS + 2 * slack) * sizeof(s32));
+        rindcnt = rc + slack;
+        rindidx = ri + slack;
+        rindlist = malloc((size_t)(NCELLS + 2 * slack) * sizeof(s32));
+        nrind = 0;
+        int k2 = 0;
+        for (int dy = -2; dy <= 2; dy++)
+            for (int dx = -2; dx <= 2; dx++)
+                if (dx != 0 || dy != 0)
+                    if (abs(dx) + abs(dy) <= 2)
+                        rind_off[k2++] = dy * PW + dx;
+    }
     lobe_feas   = calloc((size_t)1 << LOBE_TT_BITS, sizeof(u64));
     lobe_infeas = calloc((size_t)1 << LOBE_TT_BITS, sizeof(u64));
     {
@@ -1328,6 +1576,8 @@ int main(void)
     checkmask = getenv("COIL_CHECK_EVERY") ? (u32)atoi(getenv("COIL_CHECK_EVERY")) - 1 : 3;
     ops_limit = getenv("COIL_OPS_LIMIT") ? strtoull(getenv("COIL_OPS_LIMIT"), NULL, 10) : 0;
     use_window = getenv("COIL_WINDOW") != NULL;
+    use_rind = getenv("COIL_RIND") != NULL;   /* falsified: distance-2 rind
+                                                 misses pocket-scale structure */
     if (getenv("COIL_SEED"))
         seed_salt ^= (u64)strtoull(getenv("COIL_SEED"), NULL, 10) * 0xc2b2ae3d27d4eb4fULL;
     else

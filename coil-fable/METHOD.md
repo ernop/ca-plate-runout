@@ -87,11 +87,34 @@ Measured on the fixed benchmark, fixed seed, op-counted:
    block knowledge: most refutation-shortening prunes derive from
    structure far from the last ray.
 
+3. Distance-2 carved rind (Tarjan over cells within distance 2 of any
+   visited cell, boundary-rooted, plus cheap global flood when dirty):
+   level 101 stopped solving in 300M ops; 151 went 144M -> 258M. Cause:
+   pocket-scale structure extends tens of cells into virgin territory;
+   a thin band around carving contains almost none of the leaf blocks
+   the full scan exploits, so nearly all blocks touch the rind boundary
+   and yield no claims.
+
 Conclusion: the scan's knowledge must be kept current everywhere, at
 update cost bounded by the change. Locality of computation, yes;
 locality of knowledge, no. The windowed machinery (sound bounded-view
 classification) remains in the code (COIL_WINDOW) as a building block
 for per-block re-analysis in the incremental design.
+
+## Measured op anatomy (level 201, 300M-op budget, fixed seed)
+
+- 69% of all ops sit in the 75-87%-board-free bucket: shallow
+  refutations dominate; attempts die at 13-25% coverage.
+- Scans there: 11,387 calls, 58% end in a prune (49% of those prunes
+  are pure connectivity, 51% block claims). Both halves productive;
+  rule-splitting by depth is marginal, not structural.
+- Next un-falsified design: sibling scan sharing. A branch node's scan
+  certifies the parent state; each child differs by one ray. Running
+  the bounded window as a DELTA against the just-certified parent (the
+  prev-dirty obstacle disappears at that call site) can certify most
+  children without their own subtree-root scan: scan count divided by
+  the effective branching factor, claims unchanged, soundness from the
+  parent certificate plus the window lemmas.
 - Self-contained subproblems (pendant pockets behind a cut vertex) are
   decided once and cached by content; this generalizes: any state
   fragment with a provably closed boundary is a candidate for exact
