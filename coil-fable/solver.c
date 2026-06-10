@@ -57,6 +57,9 @@ static u64 nodes;
 static u64 node_budget;
 static bool aborted;
 static int dirperm[4] = {0, 1, 2, 3};   /* per-worker direction priority */
+static int order_mode;                  /* candidate ordering variant */
+static bool randtie;                    /* randomized tie-breaking */
+static u64 rng = 0x9e3779b97f4a7c15ULL;
 static bool use_forced;     /* forced-edge deficit pruning (off: net loss) */
 
 static u32 *mark;
@@ -435,7 +438,16 @@ static bool dfs(int pos)
                 return true;
             }
             if (eo == 0) continue;            /* dead end, not a win: skip */
-            int kk = (eo == 1) ? 0 : 1;       /* forced continuation first */
+            int kk;
+            switch (order_mode) {
+            case 1:  kk = (eo == 1 ? 0 : 1 << 20) - len; break; /* tie: long */
+            case 2:  kk = (eo == 1 ? 0 : 1 << 20) + len; break; /* tie: short */
+            default: kk = (eo == 1) ? 0 : 8;  break;
+            }
+            if (randtie) {
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                kk = kk * 8 + (int)(rng & 7);   /* shuffle within class */
+            }
             int a = nc++;
             while (a > 0 && key[a-1] > kk) {
                 cand[a] = cand[a-1]; key[a] = key[a-1]; a--;
@@ -552,12 +564,30 @@ int main(void)
         if (nleaves == 1 &&
             (need_color < 0 || cellcolor(leaves[0]) == need_color))
             order[ns++] = leaves[0];
-        for (int pass = 1; pass <= 4; pass++) {
-            for (int p = 0; p < NCELLS; p++) {
-                if (blocked[p]) continue;
-                if (nleaves == 1 && p == leaves[0]) continue;
-                if (need_color >= 0 && cellcolor(p) != need_color) continue;
-                if (deg[p] == pass) order[ns++] = p;
+        if (getenv("COIL_STARTS_BORDER")) {
+            /* ring order: cells nearer the board border first */
+            int maxring = (W < H ? W : H) / 2 + 1;
+            for (int ring = 0; ring <= maxring; ring++) {
+                for (int p = 0; p < NCELLS; p++) {
+                    if (blocked[p]) continue;
+                    if (nleaves == 1 && p == leaves[0]) continue;
+                    if (need_color >= 0 && cellcolor(p) != need_color) continue;
+                    int x = p % PW - 1, y = p / PW - 1;
+                    int r = x;
+                    if (y < r) r = y;
+                    if (W-1-x < r) r = W-1-x;
+                    if (H-1-y < r) r = H-1-y;
+                    if (r == ring) order[ns++] = p;
+                }
+            }
+        } else {
+            for (int pass = 1; pass <= 4; pass++) {
+                for (int p = 0; p < NCELLS; p++) {
+                    if (blocked[p]) continue;
+                    if (nleaves == 1 && p == leaves[0]) continue;
+                    if (need_color >= 0 && cellcolor(p) != need_color) continue;
+                    if (deg[p] == pass) order[ns++] = p;
+                }
             }
         }
     }
@@ -566,6 +596,8 @@ int main(void)
 
     bool dbg = getenv("COIL_DEBUG") != NULL;
     always_check = getenv("COIL_LAZY_CHECK") == NULL;  /* default: always */
+    order_mode = getenv("COIL_ORDER") ? atoi(getenv("COIL_ORDER")) : 0;
+    randtie = getenv("COIL_NORANDTIE") == NULL;        /* default: on */
     use_forced = getenv("COIL_FORCED") != NULL;
     int nworkers = 4;
     {
@@ -602,6 +634,9 @@ int main(void)
                 for (int k = w; k < ns; k += nworkers) {
                     if (dead[k]) continue;
                     alive++;
+                    rng = 0x9e3779b97f4a7c15ULL ^ ((u64)(w+1) << 40)
+                        ^ ((u64)(k+1) << 16) ^ (u64)(bi+1);
+                    rng ^= rng >> 33; rng *= 0xff51afd7ed558ccdULL; rng ^= rng >> 33;
                     bool ok = solve_from(order[k]);
                     if (!ok && !aborted) dead[k] = 1;
                     if (dbg)
