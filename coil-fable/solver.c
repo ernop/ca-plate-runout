@@ -57,7 +57,6 @@ static u64 nodes;
 static u64 node_budget;
 static bool aborted;
 
-static s32 *stack_ff;
 static u32 *mark;
 static u32 markgen;
 
@@ -107,25 +106,41 @@ static void rewind_to(int loglen, int plen)
     pathlen = plen;
 }
 
-static int flood_count(int seed, int limit)
-{
-    int top = 0, cnt = 0;
-    markgen++;
-    stack_ff[top++] = seed; mark[seed] = markgen;
-    while (top) {
-        int q = stack_ff[--top];
-        cnt++;
-        if (cnt > limit) return cnt;
-        s32 nb;
-        nb = q-1;  if (free_cell(nb) && mark[nb] != markgen) { mark[nb]=markgen; stack_ff[top++]=nb; }
-        nb = q+1;  if (free_cell(nb) && mark[nb] != markgen) { mark[nb]=markgen; stack_ff[top++]=nb; }
-        nb = q-PW; if (free_cell(nb) && mark[nb] != markgen) { mark[nb]=markgen; stack_ff[top++]=nb; }
-        nb = q+PW; if (free_cell(nb) && mark[nb] != markgen) { mark[nb]=markgen; stack_ff[top++]=nb; }
-    }
-    return cnt;
-}
+/*
+ * Region check via Tarjan articulation DFS (iterative).
+ *
+ *  - connectivity: all `remaining` cells reachable from a head neighbor
+ *  - cut-vertex rule: a Hamiltonian path visits each vertex once, so a
+ *    vertex whose removal splits the region into >= 3 components is fatal
+ *
+ * Returns false if the position is dead.
+ */
+/*
+ * A graph with a Hamiltonian path has a block-cut tree that is a path:
+ * every leaf block (biconnected component touching <=1 cut vertex) needs
+ * a path endpoint strictly inside it, and only 2 endpoints exist.
+ * So: >=3 leaf blocks => dead.  (A cut vertex separating >=3 parts gives
+ * a block-tree vertex of degree >=3, hence >=3 leaves: subsumed.)
+ */
+static u32 *disc, *low;
+static s32 *tstack;          /* DFS cell stack */
+static u8  *tdirs;           /* per-frame: next dir index to try */
+static s32 *tparent;         /* per-frame: parent cell (-1 for root) */
+static u8  *sepflag;         /* per-cell: is articulation (this call) */
+static s32 *estack;          /* edge stack: child endpoint of each edge */
+static s32 *eother;          /* edge stack: parent endpoint */
+static u32 *bcmark;          /* per-cell mark for distinct count per block */
+static u32 bcgen;
+static s32 *rbuf;            /* deferred root-block vertex lists */
+static u32 *leafmark;        /* cell is valid endpoint (interior of a leaf
+                                block); generation = markgen of the call */
 
-static bool connected_from(int pos)
+static int last_leafblocks;  /* result of the most recent region_ok */
+static u32 last_region_gen;
+
+static u64 work;             /* time-proxy budget counter */
+
+static bool region_ok(int pos)
 {
     if (remaining == 0) return true;
     int seed;
@@ -134,7 +149,125 @@ static bool connected_from(int pos)
     else if (free_cell(pos-PW)) seed = pos-PW;
     else if (free_cell(pos+PW)) seed = pos+PW;
     else return false;
-    return flood_count(seed, remaining) == remaining;
+
+    markgen++;
+    last_region_gen = markgen;
+    last_leafblocks = 0;
+    u32 counter = 0;
+    int cnt = 1;
+    int esp = 0;
+    int leafblocks = 0;
+    int root_children = 0;
+    int rb_start[5], rb_cuts[5], nrb = 0;   /* root blocks (<=4) */
+    int rbn = 0;
+
+    tstack[0] = seed; tdirs[0] = 0; tparent[0] = -1;
+    mark[seed] = markgen;
+    disc[seed] = low[seed] = ++counter;
+    sepflag[seed] = 0;
+    int top = 1;
+
+    while (top > 0) {
+        int u = tstack[top-1];
+        u8 di = tdirs[top-1];
+
+        if (di < 4) {
+            tdirs[top-1]++;
+            int v = u + DELTA[di];
+            if (!free_cell(v) || v == tparent[top-1]) continue;
+            if (mark[v] == markgen) {
+                if (disc[v] < disc[u]) {        /* upward back edge */
+                    estack[esp] = v; eother[esp] = u; esp++;
+                    if (disc[v] < low[u]) low[u] = disc[v];
+                }
+                continue;
+            }
+            mark[v] = markgen;
+            disc[v] = low[v] = ++counter;
+            sepflag[v] = 0;
+            cnt++;
+            estack[esp] = v; eother[esp] = u; esp++;   /* tree edge */
+            tstack[top] = v; tdirs[top] = 0; tparent[top] = u;
+            top++;
+        } else {
+            top--;
+            int p = tparent[top];
+            if (p < 0) break;
+            if (low[u] < low[p]) low[p] = low[u];
+            if (low[u] >= disc[p]) {
+                bcgen++;
+                if (p == seed) {
+                    /* defer: root's cut status unknown until the end */
+                    root_children++;
+                    rb_start[nrb] = rbn; rb_cuts[nrb] = 0;
+                    for (;;) {
+                        int a = estack[--esp], b = eother[esp];
+                        if (bcmark[a] != bcgen) {
+                            bcmark[a] = bcgen;
+                            if (a != seed) {
+                                rbuf[rbn++] = a;
+                                if (sepflag[a]) rb_cuts[nrb]++;
+                            }
+                        }
+                        if (bcmark[b] != bcgen) {
+                            bcmark[b] = bcgen;
+                            if (b != seed) {
+                                rbuf[rbn++] = b;
+                                if (sepflag[b]) rb_cuts[nrb]++;
+                            }
+                        }
+                        if (a == u && b == p) break;
+                    }
+                    nrb++;
+                } else {
+                    /* interior pop: all flags of this block are final */
+                    sepflag[p] = 1;
+                    int cuts = 0;
+                    int mstart = esp;   /* re-walk range for marking */
+                    for (;;) {
+                        int a = estack[--esp], b = eother[esp];
+                        if (bcmark[a] != bcgen) {
+                            bcmark[a] = bcgen;
+                            if (sepflag[a]) cuts++;
+                        }
+                        if (bcmark[b] != bcgen) {
+                            bcmark[b] = bcgen;
+                            if (sepflag[b]) cuts++;
+                        }
+                        if (a == u && b == p) break;
+                    }
+                    if (cuts <= 1) {
+                        if (++leafblocks >= 3) return false;
+                        for (int e = esp; e < mstart; e++) {
+                            if (!sepflag[estack[e]])
+                                leafmark[estack[e]] = markgen;
+                            if (!sepflag[eother[e]])
+                                leafmark[eother[e]] = markgen;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    work += (u32)cnt >> 3;
+    if (cnt != remaining) return false;
+
+    /* classify deferred root blocks */
+    bool root_cut = root_children >= 2;
+    for (int i = 0; i < nrb; i++) {
+        int cuts = rb_cuts[i] + (root_cut ? 1 : 0);
+        if (cuts <= 1) {
+            if (++leafblocks >= 3) return false;
+            int end = (i + 1 < nrb) ? rb_start[i+1] : rbn;
+            for (int j = rb_start[i]; j < end; j++)
+                if (!sepflag[rbuf[j]]) leafmark[rbuf[j]] = markgen;
+            if (!root_cut) leafmark[seed] = markgen;
+        }
+    }
+
+    last_leafblocks = leafblocks;
+    return true;
 }
 
 static inline bool parity_ok(int pos)
@@ -169,6 +302,7 @@ static inline bool struct_ok(int pos)
  * split the free region. Invariant: when false, the free region is one
  * component fully reachable from the head. */
 static bool dirty_conn;
+static bool always_check;   /* run region_ok at every branch node */
 
 /* Slide and paint; detects split-risk by counting contiguous runs of free
  * cells along both sides of the painted ray (>=2 runs => possible split). */
@@ -229,12 +363,14 @@ static bool dfs(int pos)
             continue;
         }
 
-        nodes++;
-        if (nodes > node_budget) { aborted = true; return false; }
+        nodes++; work++;
+        if (work > node_budget) { aborted = true; return false; }
 
-        if (dirty_conn) {
-            if (!connected_from(pos)) return false;
+        bool fresh_region = false;
+        if (dirty_conn || always_check) {
+            if (!region_ok(pos)) return false;
             dirty_conn = false;
+            fresh_region = true;
         }
 
         /* With exactly 2 leaves the path must start at a leaf: restrict
@@ -243,6 +379,17 @@ static bool dfs(int pos)
             int fd[4], fn = 0;
             for (int k = 0; k < nd; k++)
                 if (deg[pos + DELTA[dirs[k]]] == 1) fd[fn++] = dirs[k];
+            if (fn == 0) return false;
+            memcpy(dirs, fd, fn * sizeof(int)); nd = fn;
+        }
+
+        /* With exactly 2 leaf blocks, the next entered cell is one of the
+         * two path endpoints, which must lie strictly inside a leaf block. */
+        if (fresh_region && last_leafblocks == 2) {
+            int fd[4], fn = 0;
+            for (int k = 0; k < nd; k++)
+                if (leafmark[pos + DELTA[dirs[k]]] == last_region_gen)
+                    fd[fn++] = dirs[k];
             if (fn == 0) return false;
             memcpy(dirs, fd, fn * sizeof(int)); nd = fn;
         }
@@ -285,7 +432,7 @@ static bool solve_from(int start)
     int saveL = vloglen, saveP = pathlen;
     dirty_conn = true;          /* removing the start cell may split */
     visit_cell(start);
-    nodes = 0; aborted = false;
+    nodes = 0; work = 0; aborted = false;
     if (dfs(start)) return true;
     rewind_to(saveL, saveP);
     return false;
@@ -304,9 +451,19 @@ int main(void)
     blocked = malloc(NCELLS);
     deg     = calloc(NCELLS, 1);
     mark    = calloc(NCELLS, sizeof(u32));
-    stack_ff = malloc((size_t)NCELLS * sizeof(s32));
-    vlog     = malloc((size_t)NCELLS * sizeof(s32));
-    path     = malloc((size_t)W * H + 16);
+    vlog    = malloc((size_t)NCELLS * sizeof(s32));
+    path    = malloc((size_t)W * H + 16);
+    disc    = malloc((size_t)NCELLS * sizeof(u32));
+    low     = malloc((size_t)NCELLS * sizeof(u32));
+    tstack  = malloc((size_t)NCELLS * sizeof(s32));
+    tdirs   = malloc(NCELLS);
+    tparent = malloc((size_t)NCELLS * sizeof(s32));
+    sepflag = malloc(NCELLS);
+    estack  = malloc((size_t)NCELLS * 3 * sizeof(s32));
+    eother  = malloc((size_t)NCELLS * 3 * sizeof(s32));
+    bcmark  = calloc(NCELLS, sizeof(u32));
+    rbuf    = malloc((size_t)NCELLS * sizeof(s32));
+    leafmark = calloc(NCELLS, sizeof(u32));
 
     memset(blocked, 1, NCELLS);
     total_empty = 0;
@@ -377,6 +534,7 @@ int main(void)
     if (ns == 0) { printf("No solution found\n"); return 0; }
 
     bool dbg = getenv("COIL_DEBUG") != NULL;
+    always_check = getenv("COIL_LAZY_CHECK") == NULL;  /* default: always */
     int nworkers = 4;
     {
         const char *env = getenv("COIL_WORKERS");
@@ -399,9 +557,11 @@ int main(void)
             FILE *out = fdopen(pipes[w][1], "w");
 
             u8 *dead = calloc(ns, 1);
-            u64 budgets[] = {1000, 50000, 2000000, 100000000, (u64)1<<62};
+            /* work units scale with board size (region scans dominate) */
+            u64 scale = 1 + (u64)total_empty / 8;
+            u64 budgets[] = {1000, 50000, 2000000, 100000000, (u64)1<<48};
             for (int bi = 0; bi < 5; bi++) {
-                node_budget = budgets[bi];
+                node_budget = budgets[bi] * scale;
                 int alive = 0;
                 for (int k = w; k < ns; k += nworkers) {
                     if (dead[k]) continue;
