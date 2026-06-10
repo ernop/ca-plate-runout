@@ -714,10 +714,27 @@ static inline int sim_slide(int pos, int d, int *len, int *endopts)
     return pos;
 }
 
+static int cur_phase;        /* 0 probe, 1 capped sweep, 2 exhaust */
+static int cur_startno;      /* index of the start being attempted */
+static u64 phase_ops[3];
+
 static void ops_report(int solved)
 {
-    fprintf(stderr, "OPSRESULT solved=%d ops=%llu\n",
-            solved, (unsigned long long)ops);
+    fprintf(stderr,
+        "OPSRESULT solved=%d ops=%llu phase=%d start#=%d "
+        "p0=%llu p1=%llu p2=%llu\n",
+        solved, (unsigned long long)ops, cur_phase, cur_startno,
+        (unsigned long long)phase_ops[0],
+        (unsigned long long)phase_ops[1],
+        (unsigned long long)phase_ops[2]);
+}
+
+/* killed from outside: still emit the measurement */
+static void on_kill(int sig)
+{
+    (void)sig;
+    ops_report(0);
+    _exit(2);
 }
 
 static void print_stats(void)
@@ -1155,6 +1172,8 @@ int main(void)
             /* worker: handle starts w, w+nworkers, ... */
             prctl(PR_SET_PDEATHSIG, SIGKILL);   /* die with parent */
             if (getppid() == 1) _exit(1);       /* parent already gone */
+            signal(SIGTERM, on_kill);
+            signal(SIGINT, on_kill);
             if (nworkers > 1) {
                 for (int j = 0; j <= w; j++) close(pipes[j][0]);
                 /* don't hold the harness's stdout/stderr pipes open:
@@ -1228,6 +1247,8 @@ int main(void)
                 }
                 for (int i = 0; use_probe && i < nmine; i++) {
                     int k = act[i];
+                    cur_phase = 0; cur_startno = k;
+                    u64 ops0 = ops;
                     bool ok = false, anyalive = false;
                     int bestp = total_empty + 1;
                     for (int r = 0; r < nrounds && !ok; r++) {
@@ -1257,6 +1278,7 @@ int main(void)
                     if (anyalive) {
                         act[alive] = k; prog[alive] = bestp; alive++;
                     }
+                    phase_ops[0] += ops - ops0;
                     if (ops_out) break;
                 }
                 greedy_probe = false;
@@ -1275,13 +1297,16 @@ int main(void)
                     int kept = 0;
                     for (int i = 0; i < alive; i++) {
                         int k = act[i];
+                        cur_phase = pass; cur_startno = k;
+                        u64 ops0 = ops;
                         rng = seed_salt ^ ((u64)(k+1) << 16) ^ ((u64)pass << 56);
                         rng ^= rng >> 33; rng *= 0xff51afd7ed558ccdULL; rng ^= rng >> 33;
                         bool ok = solve_from(order[k]);
                         if (dbg)
-                            fprintf(stderr, "w%d pass%d start#%d/%d pos=(%d,%d) nodes=%llu best=%d %s\n",
+                            fprintf(stderr, "w%d pass%d start#%d/%d pos=(%d,%d) nodes=%llu best=%d aops=%llu %s\n",
                                     w, pass, k, ns, order[k] % PW - 1, order[k] / PW - 1,
                                     (unsigned long long)nodes, best_remaining,
+                                    (unsigned long long)(ops - ops0),
                                     ok ? "SOLVED" : (aborted ? "alive" : "dead"));
                         if (ok) {
                             int sx = order[k] % PW - 1, sy = order[k] / PW - 1;
@@ -1295,6 +1320,7 @@ int main(void)
                         if (aborted) {
                             act[kept] = k; prog[kept] = best_remaining; kept++;
                         }
+                        phase_ops[pass] += ops - ops0;
                         if (ops_out) break;
                     }
                     alive = kept;

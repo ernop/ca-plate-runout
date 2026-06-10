@@ -58,10 +58,19 @@ size of the board. Current quantified facts (level 101 profile):
   forced edges). Removing them is worse (search tree triples): the
   knowledge is load-bearing. The defect is re-derivation from scratch:
   each slide changes a ray, while the rescan re-reads the whole region.
+- Level 201 (8s window, op-killed): 1,961 start refutations, avg 448k ops
+  each, all full exhaustions (none budget-capped). region scans are 86%
+  of total ops; avg scan touches 2,650 cells (the whole region); each
+  refutation re-reads the board ~24 times. Transposition-table hits: 183
+  of 366k branches - the TT only pays in deep exhaustion, not in capped
+  sweeps.
 - Therefore the priority build is incremental structure maintenance:
   block-cut tree kept as a persistent object, re-analysis bounded by the
   blocks the last slide touched, with undo on backtrack. Pruning power
   unchanged; analysis cost proportional to change size.
+  Acceptance criteria, on the fixed benchmark: level 101 from 129.5M ops
+  to under 30M; level 201 solved inside 300M; no prune-rule regressions
+  (same or better prune counts per branch).
 - Self-contained subproblems (pendant pockets behind a cut vertex) are
   decided once and cached by content; this generalizes: any state
   fragment with a provably closed boundary is a candidate for exact
