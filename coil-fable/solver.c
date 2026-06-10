@@ -138,6 +138,7 @@ static s32 *estack;          /* edge stack: child endpoint of each edge */
 static s32 *eother;          /* edge stack: parent endpoint */
 static u32 *bcmark;          /* per-cell mark for distinct count per block */
 static u32 bcgen;
+static u32 dctr;             /* monotone discovery counter across calls */
 static s32 *rbuf;            /* deferred root-block vertex lists */
 static u32 *leafmark;        /* cell is valid endpoint (interior of a leaf
                                 block); generation = markgen of the call */
@@ -159,10 +160,16 @@ static bool region_ok(int pos)
     else if (free_cell(pos+PW)) seed = pos+PW;
     else return false;
 
+    if (dctr > 0xF0000000u) {           /* rare: reset before wraparound */
+        memset(disc, 0, (size_t)NCELLS * sizeof(u32));
+        dctr = 0;
+    }
     markgen++;
     last_region_gen = markgen;
     last_leafblocks = 0;
-    u32 counter = 0;
+    u32 base = dctr + 1;     /* disc >= base <=> discovered this call */
+    u32 counter = dctr;
+    dctr += (u32)remaining + 1;  /* reserve range (early returns safe) */
     int cnt = 1;
     int esp = 0;
     int leafblocks = 0;
@@ -172,7 +179,6 @@ static bool region_ok(int pos)
     int deficit = 0;    /* forced path-degree overload, max 2 fixable */
 
     tstack[0] = seed; tdirs[0] = 0; tparent[0] = -1;
-    mark[seed] = markgen;
     disc[seed] = low[seed] = ++counter;
     sepflag[seed] = 0;
     int top = 1;
@@ -208,14 +214,13 @@ static bool region_ok(int pos)
             tdirs[top-1]++;
             int v = u + DELTA[di];
             if (!free_cell(v) || v == tparent[top-1]) continue;
-            if (mark[v] == markgen) {
+            if (disc[v] >= base) {              /* discovered this call */
                 if (disc[v] < disc[u]) {        /* upward back edge */
                     estack[esp] = v; eother[esp] = u; esp++;
                     if (disc[v] < low[u]) low[u] = disc[v];
                 }
                 continue;
             }
-            mark[v] = markgen;
             disc[v] = low[v] = ++counter;
             sepflag[v] = 0;
             cnt++;
