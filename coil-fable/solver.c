@@ -84,6 +84,9 @@ static u32 markgen;
 static u64 ops, ops_limit;
 static bool ops_out;         /* op budget exhausted: stop everything */
 
+/* where do ops go, by depth? bucket = 8*remaining/total (7=near start) */
+static u64 hist_region[8], hist_visit[8], hist_branch[8];
+
 static u64 st_region_calls, st_region_cells, st_visits, st_branches;
 static u64 st_p_parity, st_p_struct, st_p_conn, st_p_lb3, st_p_cyc,
            st_p_over, st_p_feas, st_p_dirs, st_p_tt;
@@ -127,6 +130,7 @@ static inline void visit_cell(int p)
     vlog[vloglen++] = p;
     st_visits++;
     ops += 8;
+    hist_visit[(remaining * 7) / (total_empty + 1)] += 8;
 }
 
 static void rewind_to(int loglen, int plen)
@@ -502,6 +506,7 @@ static bool analyze_region(int seed, int head)
     work += (u32)cnt >> 3;
     st_region_calls++; st_region_cells += cnt;
     ops += (u64)cnt * 6;
+    hist_region[(remaining * 7) / (total_empty + 1)] += (u64)cnt * 6;
     if (cnt != remaining) { st_p_conn++; return false; }
 
     /* classify deferred root blocks */
@@ -764,6 +769,16 @@ static void print_stats(void)
         (unsigned long long)st_lobe_solves,
         (unsigned long long)st_lobe_hits,
         (unsigned long long)st_p_lobe);
+    fprintf(stderr, "  hist_region:");
+    for (int i = 7; i >= 0; i--)
+        fprintf(stderr, " %llu", (unsigned long long)hist_region[i]);
+    fprintf(stderr, "\n  hist_visit:");
+    for (int i = 7; i >= 0; i--)
+        fprintf(stderr, " %llu", (unsigned long long)hist_visit[i]);
+    fprintf(stderr, "\n  hist_branch:");
+    for (int i = 7; i >= 0; i--)
+        fprintf(stderr, " %llu", (unsigned long long)hist_branch[i]);
+    fprintf(stderr, "\n");
 }
 
 /*
@@ -1027,6 +1042,7 @@ static bool dfs(int pos)
 
         nodes++; work++; st_branches++;
         ops += 12;
+        hist_branch[(remaining * 7) / (total_empty + 1)]++;
         if (ops_limit && ops > ops_limit) {
             ops_out = true; aborted = true; return false;
         }
