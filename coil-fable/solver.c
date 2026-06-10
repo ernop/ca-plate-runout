@@ -24,6 +24,7 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <sys/select.h>
@@ -60,6 +61,7 @@ static int dirperm[4] = {0, 1, 2, 3};   /* per-worker direction priority */
 static int order_mode;                  /* candidate ordering variant */
 static bool randtie;                    /* randomized tie-breaking */
 static u64 rng = 0x9e3779b97f4a7c15ULL;
+static u64 seed_salt = 0x9e3779b97f4a7c15ULL;
 static bool use_forced;     /* forced-edge deficit pruning (off: net loss) */
 
 static u32 *mark;
@@ -608,6 +610,8 @@ int main(void)
     order_mode = getenv("COIL_ORDER") ? atoi(getenv("COIL_ORDER")) : 0;
     randtie = getenv("COIL_NORANDTIE") == NULL;        /* default: on */
     checkmask = getenv("COIL_CHECK_EVERY") ? (u32)atoi(getenv("COIL_CHECK_EVERY")) - 1 : 7;
+    if (getenv("COIL_SEED"))
+        seed_salt ^= (u64)strtoull(getenv("COIL_SEED"), NULL, 10) * 0xc2b2ae3d27d4eb4fULL;
     use_forced = getenv("COIL_FORCED") != NULL;
     int nworkers = 4;
     {
@@ -625,6 +629,8 @@ int main(void)
         if (pid < 0) { perror("fork"); return 1; }
         if (pid == 0) {
             /* worker: handle starts w, w+nworkers, ... */
+            prctl(PR_SET_PDEATHSIG, SIGKILL);   /* die with parent */
+            if (getppid() == 1) _exit(1);       /* parent already gone */
             if (nworkers > 1) {
                 for (int j = 0; j <= w; j++) close(pipes[j][0]);
             }
@@ -649,7 +655,7 @@ int main(void)
                 for (int k = w; k < ns; k += nworkers) {
                     if (dead[k]) continue;
                     alive++;
-                    rng = 0x9e3779b97f4a7c15ULL ^ ((u64)(w+1) << 40)
+                    rng = seed_salt ^ ((u64)(w+1) << 40)
                         ^ ((u64)(k+1) << 16) ^ (u64)(bi+1);
                     rng ^= rng >> 33; rng *= 0xff51afd7ed558ccdULL; rng ^= rng >> 33;
                     bool ok = solve_from(order[k]);
