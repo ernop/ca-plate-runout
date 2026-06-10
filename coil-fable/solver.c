@@ -59,6 +59,7 @@ static int  vloglen;
 static u64 nodes;
 static u64 node_budget;
 static bool aborted;
+static bool greedy_probe;    /* probe mode: first-descent only, no learning */
 static int best_remaining;   /* deepest progress of the current attempt */
 static u64 work_at_best;     /* work counter when that record was set */
 static int dirperm[4] = {0, 1, 2, 3};   /* per-worker direction priority */
@@ -75,7 +76,7 @@ static u64 st_p_parity, st_p_struct, st_p_conn, st_p_lb3, st_p_cyc,
 /* Transposition table of proven-dead states. A state is the visited set
  * (Zobrist hash, maintained incrementally) plus the head cell. Search
  * orders that permute into the same coverage collapse to one subtree. */
-#define TT_BITS 22
+#define TT_BITS 24
 static u64 *tt;
 static u64 *zkey, *zheadkey;
 static u64 zhash;
@@ -625,6 +626,7 @@ static bool dfs(int pos)
             if (dfs(np)) return true;
             rewind_to(saveL, saveP);
             dirty_conn = saveD;
+            if (greedy_probe) { aborted = true; return false; }
         }
         /* fully explored and failed: remember as dead (only if the
          * subtree was not truncated by budget or stall cutoffs) */
@@ -888,27 +890,53 @@ int main(void)
 
             if (getenv("COIL_TIERS") == NULL) {
                 /*
-                 * Two-pass sweep. Dead starts are cheap to disprove with
-                 * the pruning + transposition table (which persists and
-                 * grows across starts), and winning starts solve within a
-                 * small budget, so:
-                 *   pass 1: every start, capped budget - finds the winner
-                 *           or defers the rare monster dead trees
-                 *   pass 2: exhaust the deferred starts, deepest-progress
-                 *           first (complete: proves unsolvable if so)
+                 * Three-pass sweep, deterministic and complete.
+                 *
+                 * pass 0 (probe): every start, tiny budget. Cheap dead
+                 *   starts are eliminated outright; survivors record how
+                 *   deep the probe got. Winning starts probe DEEP: their
+                 *   probe depth ranks them near the top of the field.
+                 * pass 1 (guided): survivors in probe-depth order with a
+                 *   budget sized to known winner costs - the winner is
+                 *   normally found within the first few attempts.
+                 * pass 2 (exhaust): anything still alive, deepest first,
+                 *   unbounded - keeps the sweep complete so the true
+                 *   solution can never be skipped.
+                 *
+                 * The transposition table persists across passes, so
+                 * revisiting a start re-uses all completed dead subtrees
+                 * instead of re-deriving them.
                  */
-                int defer = 0;
-                node_budget = (u64)900 * (u64)total_empty;
+                u64 p0cap = getenv("COIL_P0CAP")
+                          ? (u64)strtoull(getenv("COIL_P0CAP"), NULL, 10)
+                          : 8;
+                u64 p1cap = getenv("COIL_P1CAP")
+                          ? (u64)strtoull(getenv("COIL_P1CAP"), NULL, 10)
+                          : 450;
+
+                int nrounds = getenv("COIL_P0R") ? atoi(getenv("COIL_P0R")) : 1;
+                int alive = 0;
+                node_budget = p0cap * (u64)total_empty;
+                greedy_probe = true;
                 for (int i = 0; i < nmine; i++) {
                     int k = act[i];
-                    rng = seed_salt ^ ((u64)(k+1) << 16);
-                    rng ^= rng >> 33; rng *= 0xff51afd7ed558ccdULL; rng ^= rng >> 33;
-                    bool ok = solve_from(order[k]);
+                    bool ok = false, anyalive = false;
+                    int bestp = total_empty + 1;
+                    for (int r = 0; r < nrounds && !ok; r++) {
+                        rng = seed_salt ^ ((u64)(k+1) << 16) ^ ((u64)r << 48);
+                        rng ^= rng >> 33; rng *= 0xff51afd7ed558ccdULL; rng ^= rng >> 33;
+                        ok = solve_from(order[k]);
+                        if (!ok && aborted) {
+                            anyalive = true;
+                            if (best_remaining < bestp) bestp = best_remaining;
+                        }
+                        if (!ok && !aborted) { anyalive = false; break; } /* proven dead */
+                    }
                     if (dbg)
-                        fprintf(stderr, "w%d pass1 start#%d/%d pos=(%d,%d) nodes=%llu %s\n",
+                        fprintf(stderr, "w%d pass0 start#%d/%d pos=(%d,%d) best=%d %s\n",
                                 w, k, ns, order[k] % PW - 1, order[k] / PW - 1,
-                                (unsigned long long)nodes,
-                                ok ? "SOLVED" : (aborted ? "defer" : "dead"));
+                                bestp,
+                                ok ? "SOLVED" : (anyalive ? "alive" : "dead"));
                     if (ok) {
                         int sx = order[k] % PW - 1, sy = order[k] / PW - 1;
                         path[pathlen] = 0;
@@ -916,35 +944,46 @@ int main(void)
                         fflush(out);
                         _exit(0);
                     }
-                    if (aborted) {
-                        act[defer] = k; prog[defer] = best_remaining; defer++;
+                    if (anyalive) {
+                        act[alive] = k; prog[alive] = bestp; alive++;
                     }
                 }
-                for (int a = 1; a < defer; a++) {
-                    int ka = act[a], pa = prog[a], b = a - 1;
-                    while (b >= 0 && prog[b] > pa) {
-                        act[b+1] = act[b]; prog[b+1] = prog[b]; b--;
+                greedy_probe = false;
+
+                for (int pass = 1; pass <= 2; pass++) {
+                    /* deepest probe progress first */
+                    for (int a = 1; a < alive; a++) {
+                        int ka = act[a], pa = prog[a], b = a - 1;
+                        while (b >= 0 && prog[b] > pa) {
+                            act[b+1] = act[b]; prog[b+1] = prog[b]; b--;
+                        }
+                        act[b+1] = ka; prog[b+1] = pa;
                     }
-                    act[b+1] = ka; prog[b+1] = pa;
-                }
-                node_budget = (u64)1 << 60;
-                for (int i = 0; i < defer; i++) {
-                    int k = act[i];
-                    rng = seed_salt ^ ((u64)(k+1) << 16) ^ 0x5851f42d4c957f2dULL;
-                    rng ^= rng >> 33; rng *= 0xff51afd7ed558ccdULL; rng ^= rng >> 33;
-                    bool ok = solve_from(order[k]);
-                    if (dbg)
-                        fprintf(stderr, "w%d pass2 start#%d/%d pos=(%d,%d) nodes=%llu %s\n",
-                                w, k, ns, order[k] % PW - 1, order[k] / PW - 1,
-                                (unsigned long long)nodes,
-                                ok ? "SOLVED" : "dead");
-                    if (ok) {
-                        int sx = order[k] % PW - 1, sy = order[k] / PW - 1;
-                        path[pathlen] = 0;
-                        fprintf(out, "x=%d&y=%d&path=%s\n", sx, sy, path);
-                        fflush(out);
-                        _exit(0);
+                    node_budget = (pass == 1) ? p1cap * (u64)total_empty
+                                              : (u64)1 << 60;
+                    int kept = 0;
+                    for (int i = 0; i < alive; i++) {
+                        int k = act[i];
+                        rng = seed_salt ^ ((u64)(k+1) << 16) ^ ((u64)pass << 56);
+                        rng ^= rng >> 33; rng *= 0xff51afd7ed558ccdULL; rng ^= rng >> 33;
+                        bool ok = solve_from(order[k]);
+                        if (dbg)
+                            fprintf(stderr, "w%d pass%d start#%d/%d pos=(%d,%d) nodes=%llu best=%d %s\n",
+                                    w, pass, k, ns, order[k] % PW - 1, order[k] / PW - 1,
+                                    (unsigned long long)nodes, best_remaining,
+                                    ok ? "SOLVED" : (aborted ? "alive" : "dead"));
+                        if (ok) {
+                            int sx = order[k] % PW - 1, sy = order[k] / PW - 1;
+                            path[pathlen] = 0;
+                            fprintf(out, "x=%d&y=%d&path=%s\n", sx, sy, path);
+                            fflush(out);
+                            _exit(0);
+                        }
+                        if (aborted) {
+                            act[kept] = k; prog[kept] = best_remaining; kept++;
+                        }
                     }
+                    alive = kept;
                 }
                 if (nworkers == 1) printf("No solution found\n");
                 _exit(1);
