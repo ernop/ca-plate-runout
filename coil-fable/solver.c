@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <time.h>
+#include <fcntl.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
@@ -636,6 +637,13 @@ int main(void)
             if (getppid() == 1) _exit(1);       /* parent already gone */
             if (nworkers > 1) {
                 for (int j = 0; j <= w; j++) close(pipes[j][0]);
+                /* don't hold the harness's stdout/stderr pipes open:
+                 * a lingering worker must never block its cleanup */
+                close(1);
+                if (!dbg) {
+                    int devnull = open("/dev/null", O_WRONLY);
+                    if (devnull >= 0) { dup2(devnull, 2); close(devnull); }
+                }
             }
             FILE *out = fdopen(pipes[w][1], "w");
             for (int i = 0; i < 4; i++) dirperm[i] = (i + w) & 3;

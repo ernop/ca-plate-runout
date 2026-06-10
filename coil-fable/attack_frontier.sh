@@ -8,6 +8,8 @@ while true; do
     F=$(cat /tmp/frontier)
     echo "=== attacking level $F at $(date +%H:%M:%S) ==="
     ./evaluate_full.py --start "$F" --timeout 600 2>&1
+    pkill -9 -x solver 2>/dev/null
+    sleep 1
     H=$(tail -1 test.md | awk -F'|' '{gsub(/ /,"",$5); print $5}')
     if [[ "$H" =~ ^[0-9]+$ ]] && [ "$H" -ge "$F" ]; then
         echo $((H + 1)) > /tmp/frontier
