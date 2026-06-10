@@ -56,6 +56,8 @@ static int  vloglen;
 static u64 nodes;
 static u64 node_budget;
 static bool aborted;
+static int dirperm[4] = {0, 1, 2, 3};   /* per-worker direction priority */
+static bool use_forced;     /* forced-edge deficit pruning (off: net loss) */
 
 static u32 *mark;
 static u32 markgen;
@@ -134,6 +136,8 @@ static u32 bcgen;
 static s32 *rbuf;            /* deferred root-block vertex lists */
 static u32 *leafmark;        /* cell is valid endpoint (interior of a leaf
                                 block); generation = markgen of the call */
+static u8  *fdeg;            /* forced path-degree from deg-2 neighbors */
+static u32 *fmark;           /* generation guard for fdeg */
 
 static int last_leafblocks;  /* result of the most recent region_ok */
 static u32 last_region_gen;
@@ -160,12 +164,36 @@ static bool region_ok(int pos)
     int root_children = 0;
     int rb_start[5], rb_cuts[5], nrb = 0;   /* root blocks (<=4) */
     int rbn = 0;
+    int deficit = 0;    /* forced path-degree overload, max 2 fixable */
 
     tstack[0] = seed; tdirs[0] = 0; tparent[0] = -1;
     mark[seed] = markgen;
     disc[seed] = low[seed] = ++counter;
     sepflag[seed] = 0;
     int top = 1;
+
+    /*
+     * Forced-edge accounting: a free cell with exactly 2 free neighbors
+     * must use both incident edges unless it is one of the path's 2
+     * endpoints. Each endpoint placed at such a cell relaxes one forced
+     * edge. A cell x can carry at most 2 path edges, so any forced count
+     * beyond 2 must be paid for by an endpoint; total budget is 2.
+     */
+#define FORCE_FROM(v)                                                     \
+    do {                                                                  \
+        if (use_forced && deg[v] == 2) {                                  \
+            for (int _i = 0; _i < 4; _i++) {                              \
+                int _x = (v) + DELTA[_i];                                 \
+                if (!free_cell(_x)) continue;                             \
+                if (fmark[_x] != markgen) { fmark[_x] = markgen; fdeg[_x] = 0; } \
+                if (++fdeg[_x] > 2) {                                     \
+                    if (++deficit > 2) return false;                      \
+                }                                                         \
+            }                                                             \
+        }                                                                 \
+    } while (0)
+
+    FORCE_FROM(seed);
 
     while (top > 0) {
         int u = tstack[top-1];
@@ -186,6 +214,7 @@ static bool region_ok(int pos)
             disc[v] = low[v] = ++counter;
             sepflag[v] = 0;
             cnt++;
+            FORCE_FROM(v);
             estack[esp] = v; eother[esp] = u; esp++;   /* tree edge */
             tstack[top] = v; tdirs[top] = 0; tparent[top] = u;
             top++;
@@ -349,10 +378,10 @@ static bool dfs(int pos)
         if (!parity_ok(pos)) return false;
 
         int dirs[4], nd = 0;
-        if (free_cell(pos-1))   dirs[nd++] = 0;
-        if (free_cell(pos-PW))  dirs[nd++] = 1;
-        if (free_cell(pos+1))   dirs[nd++] = 2;
-        if (free_cell(pos+PW))  dirs[nd++] = 3;
+        for (int i = 0; i < 4; i++) {
+            int d = dirperm[i];
+            if (free_cell(pos + DELTA[d])) dirs[nd++] = d;
+        }
 
         if (nd == 0) return false;
 
@@ -464,6 +493,8 @@ int main(void)
     bcmark  = calloc(NCELLS, sizeof(u32));
     rbuf    = malloc((size_t)NCELLS * sizeof(s32));
     leafmark = calloc(NCELLS, sizeof(u32));
+    fdeg    = calloc(NCELLS, 1);
+    fmark   = calloc(NCELLS, sizeof(u32));
 
     memset(blocked, 1, NCELLS);
     total_empty = 0;
@@ -535,6 +566,7 @@ int main(void)
 
     bool dbg = getenv("COIL_DEBUG") != NULL;
     always_check = getenv("COIL_LAZY_CHECK") == NULL;  /* default: always */
+    use_forced = getenv("COIL_FORCED") != NULL;
     int nworkers = 4;
     {
         const char *env = getenv("COIL_WORKERS");
@@ -555,12 +587,16 @@ int main(void)
                 for (int j = 0; j <= w; j++) close(pipes[j][0]);
             }
             FILE *out = fdopen(pipes[w][1], "w");
+            for (int i = 0; i < 4; i++) dirperm[i] = (i + w) & 3;
 
             u8 *dead = calloc(ns, 1);
-            /* work units scale with board size (region scans dominate) */
+            /* work units scale with board size (region scans dominate).
+             * Winning starts typically solve within a few thousand branch
+             * nodes; scan many starts cheaply before going deep. */
             u64 scale = 1 + (u64)total_empty / 8;
-            u64 budgets[] = {1000, 50000, 2000000, 100000000, (u64)1<<48};
-            for (int bi = 0; bi < 5; bi++) {
+            u64 budgets[] = {250, 4000, 32000, 256000, 4000000, 64000000, (u64)1<<44};
+            int ntiers = 7;
+            for (int bi = 0; bi < ntiers; bi++) {
                 node_budget = budgets[bi] * scale;
                 int alive = 0;
                 for (int k = w; k < ns; k += nworkers) {
