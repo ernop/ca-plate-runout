@@ -114,3 +114,30 @@ exhaustively enumerating every start of small levels, so no change could
 silently discard the (often unique) winning start.
 
 Build with `./build.sh <coilbench_dir>` (PGO two-stage compile).
+
+## State decomposition (the current frontier of the work)
+
+The deepest structural fact found: when the remaining region develops a
+cut vertex, the pendant pocket behind it is **provably self-contained** -
+no slide can cross its boundary except through the cut vertex, so "can
+this pocket still be covered, given how it can be entered?" is a closed
+sub-puzzle whose answer depends only on the pocket's cell content. The
+solver now extracts pendant pockets (<= 44 cells) during region analysis,
+decides them exactly with a bitmask micro-search, and caches verdicts by
+content hash. One micro-solve typically serves hundreds of later branches
+(measured: ~900 solves -> ~230k cache hits on one level); every branch
+that ever re-creates a hopeless pocket dies instantly.
+
+Honest assessment: at the current frontier (~70x70), most failing branches
+die in open areas rather than small pockets, so this lands as a foundation
+rather than a breakthrough. The natural continuations, in order:
+
+1. wider pockets (multi-word masks, 96+ cells) and pocket *macro-moves*
+   (when a pocket has exactly one feasible entry mode, its traversal is
+   forced: substitute it wholesale instead of searching it)
+2. unified endpoint-demand accounting (leaf blocks + forced cycles +
+   over-forced junctions share a budget of exactly 2 path endpoints;
+   currently checked piecewise)
+3. block-cut-tree macro search: when the block tree is a path, the level
+   decomposes into a sequence of per-block sub-puzzles with pinned
+   entry/exit cells - solve blocks, not cells.
