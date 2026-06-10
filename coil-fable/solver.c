@@ -24,6 +24,7 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <signal.h>
+#include <time.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
@@ -612,6 +613,8 @@ int main(void)
     checkmask = getenv("COIL_CHECK_EVERY") ? (u32)atoi(getenv("COIL_CHECK_EVERY")) - 1 : 7;
     if (getenv("COIL_SEED"))
         seed_salt ^= (u64)strtoull(getenv("COIL_SEED"), NULL, 10) * 0xc2b2ae3d27d4eb4fULL;
+    else
+        seed_salt ^= ((u64)time(NULL) * 0xc2b2ae3d27d4eb4fULL) ^ ((u64)getpid() << 32);
     use_forced = getenv("COIL_FORCED") != NULL;
     int nworkers = 4;
     {
