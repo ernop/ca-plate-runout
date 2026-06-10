@@ -644,6 +644,11 @@ int main(void)
                 static const u32 kdiv[4] = {7, 3, 11, 15};
                 checkmask = kdiv[w & 3];
             }
+            if (!getenv("COIL_ORDER")) {
+                /* diversify slide-length tiebreak: w2 long, w3 short */
+                static const int omode[4] = {0, 0, 1, 2};
+                order_mode = omode[w & 3];
+            }
 
             u8 *dead = calloc(ns, 1);
             /* work units scale with board size (region scans dominate).
