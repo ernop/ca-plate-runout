@@ -22,3 +22,6 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# coilbench upstream clone (not part of this repo)
+coilbench/
