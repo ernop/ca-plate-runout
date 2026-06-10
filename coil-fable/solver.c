@@ -655,7 +655,7 @@ static inline bool struct_ok(int pos)
  * component fully reachable from the head. */
 static bool dirty_conn;
 static bool always_check;   /* run region_ok at every branch node */
-static u32 checktick, checkmask;  /* gate region_ok to every (mask+1)th */
+static u32 checktick, checkmask;
 
 /* Local change analysis: seeds = first free cell of each side-run along
  * the last painted ray. A capped flood from a seed that CLOSES (finds a
@@ -665,12 +665,13 @@ static u32 checktick, checkmask;  /* gate region_ok to every (mask+1)th */
 static s32 lseeds[LSEED_MAX];
 static int nlseeds;
 static bool lseeds_valid;
-static bool use_local;       /* measured net-negative at <=70x70; the
-                                foundation for incremental structure */
-static u64 st_p_local, st_local_floods;
+static bool prev_dirty;      /* dirty state before the last slide */
+static u64 st_p_local;
 
 /* Slide and paint; detects split-risk by counting contiguous runs of free
  * cells along both sides of the painted ray (>=2 runs => possible split). */
+static int ray_start, ray_dir, ray_len;   /* last committed slide */
+
 static inline int do_slide(int pos, int d)
 {
     s32 dd = DELTA[d];
@@ -678,8 +679,10 @@ static inline int do_slide(int pos, int d)
     int runs = 0;
     bool pl = false, pr = false;
     nlseeds = 0;
+    ray_start = pos + dd; ray_dir = d; ray_len = 0;
     do {
         pos += dd;
+        ray_len++;
         visit_cell(pos);
         bool l = free_cell(pos - pp);
         bool r = free_cell(pos + pp);
@@ -693,8 +696,9 @@ static inline int do_slide(int pos, int d)
         }
         pl = l; pr = r;
     } while (free_cell(pos + dd));
+    prev_dirty = dirty_conn;
     if (runs >= 2) dirty_conn = true;
-    lseeds_valid = (runs >= 2) && (runs <= LSEED_MAX);
+    lseeds_valid = (runs >= 1);
     return pos;
 }
 
@@ -762,41 +766,207 @@ static void print_stats(void)
         (unsigned long long)st_p_lobe);
 }
 
-/* Capped floods from the last slide's side-runs. Any closed component
- * smaller than the region is a sealed, unreachable pocket: dead. If one
- * flood closes over the WHOLE region, connectivity is re-certified for
- * free. Cost is bounded by the change, not the region. */
-static bool local_ok(void)
+/*
+ * Windowed structural analysis around the last painted ray.
+ *
+ * The window is the set of free cells within a bounded flood of the ray.
+ * Sound claims inside a bounded view:
+ *  - a window component with NO cell on the window boundary is a true
+ *    component of the whole region; if smaller than the region it is a
+ *    sealed, unreachable pocket: dead.
+ *  - a biconnected leaf block whose non-cut cells include no boundary
+ *    cell is a true pendant lobe: it demands a path endpoint strictly
+ *    inside (>= 3 disjoint such lobes: dead) and is micro-refutable.
+ *  - if all boundary-reaching parts of the window are one component,
+ *    the ray did not split the region: connectivity is re-certified
+ *    without reading the rest of the board.
+ * Anything touching the boundary yields no claim. Cost is proportional
+ * to the change neighborhood, never to the region.
+ */
+#define WINCAP 256
+static u32 *winmark;
+static u8  *wbound;
+static s32 *winlist;
+static u32 wingen;
+static bool use_window;     /* falsified as scan replacement at <=104x102;
+                               retained as a component for the incremental
+                               structure build */
+static u64 st_win_calls, st_win_cells, st_p_winseal, st_p_winlobe;
+
+static bool window_analyze(int head)
 {
     lseeds_valid = false;
-    int top;
-    for (int s = 0; s < nlseeds; s++) {
-        int seed = lseeds[s];
-        markgen++;   /* fresh generation: capped floods must not leak */
-        if (blocked[seed] || mark[seed] == markgen) continue;
-        st_local_floods++;
-        top = 0;
-        tstack[top++] = seed; mark[seed] = markgen;
-        int cnt = 1;
-        bool capped = false;
-        while (top) {
-            int q = tstack[--top];
-            for (int d = 0; d < 4; d++) {
-                int nb = q + DELTA[d];
-                if (blocked[nb] || mark[nb] == markgen) continue;
-                mark[nb] = markgen;
-                tstack[top++] = nb;
-                if (++cnt > LFLOOD_CAP) { capped = true; top = 0; break; }
+    /* ---- build window: flood from the ray's free neighbors ---- */
+    wingen++;
+    int wn = 0, qh = 0;
+    bool seeds_complete = true;
+    int p = ray_start;
+    for (int i = 0; i < ray_len; i++, p += DELTA[ray_dir]) {
+        for (int d = 0; d < 4; d++) {
+            int nb = p + DELTA[d];
+            if (!blocked[nb] && winmark[nb] != wingen) {
+                if (wn >= WINCAP) { seeds_complete = false; break; }
+                winmark[nb] = wingen; wbound[nb] = 0;
+                winlist[wn++] = nb;
             }
         }
-        ops += (u32)cnt * 2;
-        if (capped) continue;
-        if (cnt < remaining) { st_p_local++; return false; }
-        dirty_conn = false;     /* one component covers everything */
-        return true;
+        if (!seeds_complete) break;
     }
+    if (wn == 0) return true;
+    while (qh < wn && wn < WINCAP) {
+        int q = winlist[qh++];
+        for (int d = 0; d < 4; d++) {
+            int nb = q + DELTA[d];
+            if (blocked[nb] || winmark[nb] == wingen) continue;
+            winmark[nb] = wingen; wbound[nb] = 0;
+            winlist[wn++] = nb;
+            if (wn >= WINCAP) break;
+        }
+    }
+    /* boundary: window cells with a free neighbor outside the window */
+    for (int i = 0; i < wn; i++) {
+        int q = winlist[i];
+        for (int d = 0; d < 4; d++) {
+            int nb = q + DELTA[d];
+            if (!blocked[nb] && winmark[nb] != wingen) { wbound[q] = 1; break; }
+        }
+    }
+    ops += (u64)wn * 3;
+    st_win_calls++; st_win_cells += wn;
+
+    /* ---- per component: sealed test, then Tarjan from a boundary root */
+    markgen++;                      /* component sweep marker via mark[] */
+    int bcomp = 0;                  /* boundary-touching components seen */
+    for (int i = 0; i < wn; i++) {
+        int s0 = winlist[i];
+        if (mark[s0] == markgen) continue;
+        /* flood this component inside the window; find a boundary cell */
+        int top = 0, csz = 0, root = -1;
+        tstack[top++] = s0; mark[s0] = markgen;
+        int chead = -1;
+        while (top) {
+            int q = tstack[--top];
+            csz++;
+            if (wbound[q] && root < 0) root = q;
+            if (chead < 0 && head >= 0 &&
+                (q == head-1 || q == head+1 || q == head-PW || q == head+PW))
+                chead = q;
+            for (int d = 0; d < 4; d++) {
+                int nb = q + DELTA[d];
+                if (blocked[nb] || winmark[nb] != wingen || mark[nb] == markgen)
+                    continue;
+                mark[nb] = markgen;
+                tstack[top++] = nb;
+            }
+        }
+        ops += (u64)csz * 2;
+        if (root < 0) {
+            /* sealed: a true region component */
+            if (csz < remaining) { st_p_winseal++; return false; }
+            root = s0;     /* window holds the whole region: analyze it,
+                              root pops simply make no claims */
+        } else {
+            bcomp++;
+        }
+        (void)chead;
+
+        /* Tarjan rooted at the boundary cell: root blocks touch the
+         * boundary by construction and are never classified, so no
+         * deferred root handling is needed. */
+        u32 base = dctr + 1;
+        u32 counter = dctr;
+        dctr += (u32)csz + 1;
+        if (dctr > 0xF0000000u) {
+            memset(disc, 0, (size_t)NCELLS * sizeof(u32));
+            dctr = 0; base = 1; counter = 0; dctr = (u32)csz + 1;
+        }
+        int esp = 0;
+        int lobes = 0;
+        tstack[0] = root; tdirs[0] = 0; tparent[0] = -1;
+        disc[root] = low[root] = ++counter;
+        sepflag[root] = 0;
+        top = 1;
+        while (top > 0) {
+            int u = tstack[top-1];
+            u8 di = tdirs[top-1];
+            if (di < 4) {
+                tdirs[top-1]++;
+                int v = u + DELTA[di];
+                if (blocked[v] || winmark[v] != wingen || v == tparent[top-1])
+                    continue;
+                if (disc[v] >= base) {
+                    if (disc[v] < disc[u]) {
+                        estack[esp] = v; eother[esp] = u; esp++;
+                        if (disc[v] < low[u]) low[u] = disc[v];
+                    }
+                    continue;
+                }
+                disc[v] = low[v] = ++counter;
+                sepflag[v] = 0;
+                estack[esp] = v; eother[esp] = u; esp++;
+                tstack[top] = v; tdirs[top] = 0; tparent[top] = u;
+                top++;
+            } else {
+                top--;
+                int pp = tparent[top];
+                if (pp < 0) break;
+                if (low[u] < low[pp]) low[pp] = low[u];
+                if (low[u] >= disc[pp]) {
+                    bcgen++;
+                    if (pp == root) {
+                        /* root block: boundary-touching, no claim */
+                        for (;;) {
+                            int a = estack[--esp], b = eother[esp];
+                            if (a == u && b == pp) break;
+                        }
+                    } else {
+                        sepflag[pp] = 1;
+                        int cuts = 0, bnd = 0, bv = 0;
+                        for (;;) {
+                            int a = estack[--esp], b = eother[esp];
+                            if (bcmark[a] != bcgen) {
+                                bcmark[a] = bcgen;
+                                if (bv < LOBE_MAX) lb_cells[bv] = a;
+                                bv++;
+                                if (sepflag[a]) cuts++;
+                                else if (wbound[a]) bnd++;
+                            }
+                            if (bcmark[b] != bcgen) {
+                                bcmark[b] = bcgen;
+                                if (bv < LOBE_MAX) lb_cells[bv] = b;
+                                bv++;
+                                if (sepflag[b]) cuts++;
+                                else if (wbound[b]) bnd++;
+                            }
+                            if (a == u && b == pp) break;
+                        }
+                        if (cuts <= 1 && bnd == 0 && wbound[pp] == 0 &&
+                            bv < remaining) {
+                            /* true pendant lobe, fully interior */
+                            if (++lobes >= 3) { st_p_winlobe++; return false; }
+                            if (bv <= LOBE_MAX) {
+                                lb_n = bv;
+                                if (!lobe_check(pp, head)) {
+                                    st_p_winlobe++;
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ops += (u64)csz * 5;
+    }
+    /* Split resolution: every post-slide component contains a free
+     * neighbor of the ray (all inside the window), so if exactly one
+     * boundary-reaching component exists and no sealed one survived,
+     * the region is still connected - PROVIDED it was connected before
+     * this slide (prev_dirty false). */
+    if (bcomp <= 1 && !prev_dirty && seeds_complete) dirty_conn = false;
     return true;
 }
+
 
 static bool dfs(int pos)
 {
@@ -805,7 +975,7 @@ static bool dfs(int pos)
         if (aborted) return false;
         if (!struct_ok(pos)) { st_p_struct++; return false; }
         if (!parity_ok(pos)) { st_p_parity++; return false; }
-        if (use_local && lseeds_valid && !local_ok()) return false;
+        if (use_window && lseeds_valid && !window_analyze(pos)) return false;
 
         int dirs[4], nd = 0;
         for (int i = 0; i < 4; i++) {
@@ -871,12 +1041,13 @@ static bool dfs(int pos)
         u32 ttidx = (u32)((ttkey * 0x9e3779b97f4a7c15ULL) >> (64 - TT_BITS));
         if (tt[ttidx] == ttkey) { st_p_tt++; return false; }
 
-        /* Region analysis cadence scales with region size: a scan costs
-         * O(remaining), so near the root (huge region, weak structure)
-         * scan sparsely; deep down (small region, dense structure) scan
-         * every branch node, where scans are cheap and prunes are likely.
-         * Sealed-pocket detection is handled at every slide by local_ok,
-         * so full scans are needed only for cut/block structure. */
+        /* Region analysis cadence scales with region size (cost O(r),
+         * frequency 1/r: constant amortized cost per branch). Falsified
+         * alternatives, by ops measurement: sparser scans (tree x3),
+         * window-only with event-driven scans (fewer refutations/op even
+         * at 104x102). The scan's region-global block knowledge is what
+         * keeps refutations short; only an incrementally MAINTAINED
+         * structure can cut this cost without losing it. */
         bool fresh_region = false;
         u32 cadence = (u32)(remaining >> 9);
         if ((dirty_conn || always_check) &&
@@ -997,6 +1168,9 @@ int main(void)
     zheadkey = malloc((size_t)NCELLS * sizeof(u64));
     lobemark = calloc(NCELLS, sizeof(u32));
     lobeslot = calloc(NCELLS, sizeof(u32));
+    winmark = calloc(NCELLS, sizeof(u32));
+    wbound  = calloc(NCELLS, 1);
+    winlist = malloc(((size_t)WINCAP + 8) * sizeof(s32));
     lobe_feas   = calloc((size_t)1 << LOBE_TT_BITS, sizeof(u64));
     lobe_infeas = calloc((size_t)1 << LOBE_TT_BITS, sizeof(u64));
     {
@@ -1137,7 +1311,7 @@ int main(void)
     randtie = getenv("COIL_NORANDTIE") == NULL;        /* default: on */
     checkmask = getenv("COIL_CHECK_EVERY") ? (u32)atoi(getenv("COIL_CHECK_EVERY")) - 1 : 3;
     ops_limit = getenv("COIL_OPS_LIMIT") ? strtoull(getenv("COIL_OPS_LIMIT"), NULL, 10) : 0;
-    use_local = getenv("COIL_LOCAL") != NULL;
+    use_window = getenv("COIL_WINDOW") != NULL;
     if (getenv("COIL_SEED"))
         seed_salt ^= (u64)strtoull(getenv("COIL_SEED"), NULL, 10) * 0xc2b2ae3d27d4eb4fULL;
     else
