@@ -64,6 +64,7 @@ static bool use_forced;     /* forced-edge deficit pruning (off: net loss) */
 
 static u32 *mark;
 static u32 markgen;
+static u64 st_region_calls, st_region_cells, st_visits, st_branches;
 
 static inline int cellcolor(int p) { return ((p % PW) + (p / PW)) & 1; }
 static inline bool free_cell(int p) { return !blocked[p]; }
@@ -93,6 +94,7 @@ static inline void visit_cell(int p)
     if (!blocked[p-PW]) dec_deg(p-PW);
     if (!blocked[p+PW]) dec_deg(p+PW);
     vlog[vloglen++] = p;
+    st_visits++;
 }
 
 static void rewind_to(int loglen, int plen)
@@ -283,6 +285,7 @@ static bool region_ok(int pos)
     }
 
     work += (u32)cnt >> 3;
+    st_region_calls++; st_region_cells += cnt;
     if (cnt != remaining) return false;
 
     /* classify deferred root blocks */
@@ -335,6 +338,7 @@ static inline bool struct_ok(int pos)
  * component fully reachable from the head. */
 static bool dirty_conn;
 static bool always_check;   /* run region_ok at every branch node */
+static u32 checktick, checkmask;  /* gate region_ok to every (mask+1)th */
 
 /* Slide and paint; detects split-risk by counting contiguous runs of free
  * cells along both sides of the painted ray (>=2 runs => possible split). */
@@ -395,11 +399,11 @@ static bool dfs(int pos)
             continue;
         }
 
-        nodes++; work++;
+        nodes++; work++; st_branches++;
         if (work > node_budget) { aborted = true; return false; }
 
         bool fresh_region = false;
-        if (dirty_conn || always_check) {
+        if ((dirty_conn || always_check) && (++checktick & checkmask) == 0) {
             if (!region_ok(pos)) return false;
             dirty_conn = false;
             fresh_region = true;
@@ -598,6 +602,7 @@ int main(void)
     always_check = getenv("COIL_LAZY_CHECK") == NULL;  /* default: always */
     order_mode = getenv("COIL_ORDER") ? atoi(getenv("COIL_ORDER")) : 0;
     randtie = getenv("COIL_NORANDTIE") == NULL;        /* default: on */
+    checkmask = getenv("COIL_CHECK_EVERY") ? (u32)atoi(getenv("COIL_CHECK_EVERY")) - 1 : 7;
     use_forced = getenv("COIL_FORCED") != NULL;
     int nworkers = 4;
     {
@@ -649,6 +654,14 @@ int main(void)
                         path[pathlen] = 0;
                         fprintf(out, "x=%d&y=%d&path=%s\n", sx, sy, path);
                         fflush(out);
+                        if (getenv("COIL_STATS"))
+                            fprintf(stderr,
+                                "w%d stats: region_calls=%llu region_cells=%llu visits=%llu branches=%llu\n",
+                                w,
+                                (unsigned long long)st_region_calls,
+                                (unsigned long long)st_region_cells,
+                                (unsigned long long)st_visits,
+                                (unsigned long long)st_branches);
                         _exit(0);
                     }
                 }
