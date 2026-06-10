@@ -915,10 +915,16 @@ int main(void)
                           : 450;
 
                 int nrounds = getenv("COIL_P0R") ? atoi(getenv("COIL_P0R")) : 1;
+                bool use_probe = getenv("COIL_PROBE") != NULL;
                 int alive = 0;
                 node_budget = p0cap * (u64)total_empty;
                 greedy_probe = true;
-                for (int i = 0; i < nmine; i++) {
+                if (!use_probe) {
+                    /* probe ordering disabled: keep constructed order */
+                    for (int i = 0; i < nmine; i++) prog[i] = 0;
+                    alive = nmine;
+                }
+                for (int i = 0; use_probe && i < nmine; i++) {
                     int k = act[i];
                     bool ok = false, anyalive = false;
                     int bestp = total_empty + 1;
