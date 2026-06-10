@@ -616,6 +616,19 @@ int main(void)
         seed_salt ^= (u64)strtoull(getenv("COIL_SEED"), NULL, 10) * 0xc2b2ae3d27d4eb4fULL;
     else
         seed_salt ^= ((u64)time(NULL) * 0xc2b2ae3d27d4eb4fULL) ^ ((u64)getpid() << 32);
+
+    /* Shuffle the start order (keeping proven-endpoint leaves first) so
+     * every attempt scans a different prefix: winning starts are sparse
+     * and a fixed order makes restarts re-tread the same ground. */
+    if (getenv("COIL_NOSHUFFLE") == NULL && nleaves < 2) {
+        int lo = (nleaves == 1) ? 1 : 0;
+        u64 r = seed_salt ^ 0xa076bca5915f7445ULL;
+        for (int i = ns - 1; i > lo; i--) {
+            r ^= r << 13; r ^= r >> 7; r ^= r << 17;
+            int j = lo + (int)(r % (u64)(i - lo + 1));
+            int t = order[i]; order[i] = order[j]; order[j] = t;
+        }
+    }
     use_forced = getenv("COIL_FORCED") != NULL;
     int nworkers = 4;
     {
