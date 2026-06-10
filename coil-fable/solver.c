@@ -243,6 +243,30 @@ static int last_ncyc;        /* forced cycles found by most recent call */
 static u32 last_region_gen;
 
 /*
+ * Stage A of incremental structure: every full scan RECORDS the block
+ * decomposition instead of discarding it. blkid[cell] = block ordinal
+ * for non-cut cells, cutflag for cut vertices, both generation-tagged
+ * with the scan's markgen. Verified by invariants under COIL_PARANOID.
+ * Stage B (next): delta re-analysis of only the blocks touched by a ray.
+ */
+static u32 *blkid;           /* block ordinal (gen-tagged via blkgenof) */
+static u32 *blkgenof;        /* generation of blkid/cutflag validity */
+static u8  *cutflag;
+static int  nblocks;
+static int *blk_size;
+static u8  *blk_leaf;
+static bool use_struct;      /* record decomposition (Stage A) */
+static bool paranoid;
+
+static inline void blk_tag(int cell, int ord, bool is_cut)
+{
+    if (!use_struct) return;
+    blkgenof[cell] = markgen;
+    cutflag[cell] = is_cut;
+    if (!is_cut) blkid[cell] = (u32)ord;
+}
+
+/*
  * Pendant-lobe micro-solver.
  *
  * A leaf block B with cut vertex c is self-contained: by definition no
@@ -553,6 +577,7 @@ static bool analyze_region(int seed, int head)
     last_region_gen = markgen;
     last_leafblocks = 0;
     last_ncyc = 0;
+    nblocks = 0;
     u32 base = dctr + 1;     /* disc >= base <=> discovered this call */
     u32 counter = dctr;
     dctr += (u32)remaining + 1;  /* reserve range (early returns safe) */
@@ -625,11 +650,13 @@ static bool analyze_region(int seed, int head)
                     /* interior pop: all flags of this block are final */
                     sepflag[p] = 1;
                     int cuts = 0, blkverts = 0, bbal = 0, c_other = -1;
+                    int ord = nblocks++;
                     int mstart = esp;   /* re-walk range for marking */
                     for (;;) {
                         int a = estack[--esp], b = eother[esp];
                         if (bcmark[a] != bcgen) {
                             bcmark[a] = bcgen;
+                            blk_tag(a, ord, sepflag[a]);
                             if (blkverts < LOBE_MAX) lb_cells[blkverts] = a;
                             blkverts++;
                             bbal += cellcolor(a) ? -1 : 1;
@@ -637,12 +664,18 @@ static bool analyze_region(int seed, int head)
                         }
                         if (bcmark[b] != bcgen) {
                             bcmark[b] = bcgen;
+                            blk_tag(b, ord, sepflag[b]);
                             if (blkverts < LOBE_MAX) lb_cells[blkverts] = b;
                             blkverts++;
                             bbal += cellcolor(b) ? -1 : 1;
                             if (sepflag[b]) { cuts++; if (b != p) c_other = b; }
                         }
                         if (a == u && b == p) break;
+                    }
+                    if (use_struct) {
+                        blk_size[ord] = blkverts;
+                        blk_leaf[ord] = (cuts <= 1);
+                        ops += (u64)blkverts;
                     }
                     if (use_chain && cuts == 2 && c_other >= 0 &&
                         blkverts <= LOBE_MAX && blkverts < remaining) {
@@ -717,6 +750,15 @@ static bool analyze_region(int seed, int head)
     for (int i = 0; i < nrb; i++) {
         int cuts = rb_cuts[i] + (root_cut ? 1 : 0);
         int end = (i + 1 < nrb) ? rb_start[i+1] : rbn;
+        if (use_struct) {
+            int ord = nblocks++;
+            for (int j = rb_start[i]; j < end; j++)
+                blk_tag(rbuf[j], ord, sepflag[rbuf[j]]);
+            blk_tag(seed, ord, root_cut);
+            blk_size[ord] = end - rb_start[i] + 1;
+            blk_leaf[ord] = (cuts <= 1);
+            ops += (u64)(end - rb_start[i] + 1);
+        }
         if (cuts <= 1) {
             if (++leafblocks >= 3) { st_p_lb3++; return false; }
             u8 bid = (u8)(leafblocks - 1);
@@ -753,6 +795,20 @@ static bool analyze_region(int seed, int head)
     }
 
     last_leafblocks = leafblocks;
+
+    /* Stage A invariant verification: every free cell tagged this scan,
+     * non-cut ordinals valid. Catches bookkeeping drift immediately. */
+    if (use_struct && paranoid) {
+        for (int i = 0; i < cnt; i++) {
+            int v = rlist[i];
+            if (blkgenof[v] != markgen ||
+                (!cutflag[v] && (int)blkid[v] >= nblocks)) {
+                fprintf(stderr, "PARANOID FAIL cell=%d gen=%u/%u cut=%d id=%u nb=%d\n",
+                        v, blkgenof[v], markgen, cutflag[v], blkid[v], nblocks);
+                _exit(9);
+            }
+        }
+    }
 
     /* ---- forced-edge analysis ---- */
     if (remaining >= 12) {
@@ -1588,6 +1644,11 @@ int main(void)
     lobeslot = calloc(NCELLS, sizeof(u32));
     winmark = calloc(NCELLS, sizeof(u32));
     wbound  = calloc(NCELLS, 1);
+    blkid    = calloc(NCELLS, sizeof(u32));
+    blkgenof = calloc(NCELLS, sizeof(u32));
+    cutflag  = calloc(NCELLS, 1);
+    blk_size = malloc(((size_t)NCELLS / 2 + 2) * sizeof(int));
+    blk_leaf = malloc((size_t)NCELLS / 2 + 2);
     winlist = malloc(((size_t)WINCAP + 8) * sizeof(s32));
     {
         /* rind arrays carry 2-row slack: distance-2 offsets from border
@@ -1750,6 +1811,8 @@ int main(void)
     use_rind = getenv("COIL_RIND") != NULL;   /* falsified: distance-2 rind
                                                  misses pocket-scale structure */
     use_chain = getenv("COIL_CHAIN") != NULL;
+    use_struct = getenv("COIL_STRUCT") != NULL;
+    paranoid = getenv("COIL_PARANOID") != NULL;
     if (getenv("COIL_SEED"))
         seed_salt ^= (u64)strtoull(getenv("COIL_SEED"), NULL, 10) * 0xc2b2ae3d27d4eb4fULL;
     else

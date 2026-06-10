@@ -25,3 +25,20 @@ Measured: 31: +25%; 101: +2.6%; 151: -0.2%. Ground truth PASS.
 REJECTED: the always-on flood cost (up to 8 capped floods per scan, no
 mark sharing possible without leak-unsoundness) exceeds the savings; the
 conn-prunes are mostly NOT small pockets adjacent to the last ray.
+
+## ITER 3 - lazy (dirty-only) scans under the op metric
+Measured via COIL_LAZY_CHECK: bit-identical op counts to always-mode on
+31/101/151. The runs>=2 dirty test fires at essentially every cadence
+tick; "lazy" is a no-op. A sharper dirty test cannot skip scans anyway:
+hugging slides (runs<=1) still create cut structure, so skipping their
+scans starves claims (the falsified design-2 mechanism). CLOSED: scan
+frequency is irreducible without maintained structure.
+
+## ITER 4 - Stage A of incremental structure: record the decomposition
+Change: every full scan tags blkid/cutflag per cell (generation-tagged)
+and records per-block size and leaf status. COIL_PARANOID verifies the
+invariants (all free cells tagged, ordinals valid) after every scan.
+Measured: paranoid runs pass on 31/101/151 with identical winners;
+storage costs +13% ops when enabled (101: 129.1M -> 146.6M); default
+path bit-identical to baseline. Storage stays gated (COIL_STRUCT) until
+Stage B consumes it. ACCEPTED as foundation.
