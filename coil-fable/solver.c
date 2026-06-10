@@ -170,6 +170,160 @@ static int last_leafblocks;  /* result of the most recent region_ok */
 static int last_ncyc;        /* forced cycles found by most recent call */
 static u32 last_region_gen;
 
+/*
+ * Pendant-lobe micro-solver.
+ *
+ * A leaf block B with cut vertex c is self-contained: by definition no
+ * free edge leaves B except through c, so slide dynamics inside B depend
+ * only on B's own cell set. If B is small, the question "can a path that
+ * enters B at cell f moving in direction d cover ALL of B?" is decided
+ * exactly by a tiny search, and the verdict depends only on (B, f, d).
+ * Verdicts are cached by content hash; if no possible entry mode can
+ * cover B, every state containing this pocket is dead.
+ */
+#define LOBE_MAX 44
+#define LOBE_NODE_CAP 60000
+static int  lb_n;                     /* cells in current lobe */
+static s32  lb_cells[LOBE_MAX + 4];
+static int  lb_nbr[LOBE_MAX + 4][4];  /* local adjacency (-1 = blocked) */
+static u32 *lobemark;                 /* global cell -> lobe slot + 1 */
+static u32  lobegen;
+static u32 *lobeslot;
+static u64  lb_full;
+static u64  lb_need;    /* required coverage: all cells, cut vertex optional
+                           (it can be covered by a pass-by from outside) */
+static int  lb_micro_nodes;
+
+/* verdict cache: key -> feasible / infeasible */
+#define LOBE_TT_BITS 20
+static u64 *lobe_feas, *lobe_infeas;
+static u64 st_lobe_solves, st_lobe_hits, st_p_lobe;
+
+static bool lobe_dfs(u64 mask, int p)
+{
+    if ((mask & lb_need) == lb_need) return true;
+    if (++lb_micro_nodes > LOBE_NODE_CAP) return true; /* unknown: no prune */
+    for (int d = 0; d < 4; d++) {
+        int q = lb_nbr[p][d];
+        if (q < 0 || (mask >> q) & 1) continue;
+        u64 m = mask;
+        int r = q;
+        m |= (u64)1 << r;
+        for (;;) {
+            int nx = lb_nbr[r][d];
+            if (nx < 0 || (m >> nx) & 1) break;
+            r = nx; m |= (u64)1 << r;
+        }
+        if (lobe_dfs(m, r)) return true;
+    }
+    return false;
+}
+
+/* can a path entering the lobe at slot f, moving in direction d (slide
+ * continues), cover the whole lobe? */
+static bool lobe_entry_feasible(u64 chash, int f, int d)
+{
+    u64 key = chash ^ ((u64)(f * 4 + d + 1) * 0xc2b2ae3d27d4eb4fULL);
+    key ^= key >> 29; key *= 0x9e3779b97f4a7c15ULL; key ^= key >> 32;
+    u32 idx = (u32)(key >> (64 - LOBE_TT_BITS));
+    if (lobe_feas[idx] == key)   { st_lobe_hits++; return true; }
+    if (lobe_infeas[idx] == key) { st_lobe_hits++; return false; }
+
+    /* enter at f and slide along d as far as possible */
+    u64 mask = (u64)1 << f;
+    int r = f;
+    for (;;) {
+        int nx = lb_nbr[r][d];
+        if (nx < 0 || (mask >> nx) & 1) break;
+        r = nx; mask |= (u64)1 << r;
+    }
+    lb_micro_nodes = 0;
+    st_lobe_solves++;
+    bool ok = lobe_dfs(mask, r);
+    bool capped = lb_micro_nodes > LOBE_NODE_CAP;
+    if (!capped) {
+        if (ok) lobe_feas[idx] = key; else lobe_infeas[idx] = key;
+    }
+    return ok || capped;
+}
+
+/* Build local structure for a lobe given its cell list (set by caller in
+ * lb_cells/lb_n); returns its content hash. */
+static u64 lobe_build(void)
+{
+    lobegen++;
+    u64 h = 0;
+    for (int i = 0; i < lb_n; i++) {
+        lobemark[lb_cells[i]] = lobegen;
+        lobeslot[lb_cells[i]] = (u32)i;
+        h ^= zkey[lb_cells[i]];
+    }
+    for (int i = 0; i < lb_n; i++) {
+        int p = lb_cells[i];
+        for (int d = 0; d < 4; d++) {
+            int q = p + DELTA[d];
+            lb_nbr[i][d] = (!blocked[q] && lobemark[q] == lobegen)
+                         ? (int)lobeslot[q] : -1;
+        }
+    }
+    lb_full = (lb_n >= 64) ? ~(u64)0 : (((u64)1 << lb_n) - 1);
+    return h;
+}
+
+/*
+ * Check one pendant lobe: B = block cells (including cut vertex c).
+ * head: current search head (or -1). Returns false => current state dead.
+ */
+static bool lobe_check(int c, int head)
+{
+    u64 chash = lobe_build() ^ zheadkey[c];  /* cut vertex is part of key */
+    int cslot = (int)lobeslot[c];
+    lb_need = lb_full & ~((u64)1 << cslot);
+
+    /* entry modes via the cut vertex: launch from c into the lobe */
+    for (int d = 0; d < 4; d++) {
+        if (lb_nbr[cslot][d] < 0) continue;
+        /* path occupies c first, then slides d */
+        u64 key = chash ^ ((u64)(cslot * 4 + d + 101) * 0x165667b19e3779f9ULL);
+        key ^= key >> 29; key *= 0x9e3779b97f4a7c15ULL; key ^= key >> 32;
+        u32 idx = (u32)(key >> (64 - LOBE_TT_BITS));
+        bool ok;
+        if (lobe_feas[idx] == key)        { st_lobe_hits++; ok = true; }
+        else if (lobe_infeas[idx] == key) { st_lobe_hits++; ok = false; }
+        else {
+            u64 mask = (u64)1 << cslot;
+            int r = cslot;
+            for (;;) {
+                int nx = lb_nbr[r][d];
+                if (nx < 0 || (mask >> nx) & 1) break;
+                r = nx; mask |= (u64)1 << r;
+            }
+            lb_micro_nodes = 0;
+            st_lobe_solves++;
+            ok = lobe_dfs(mask, r);
+            bool capped = lb_micro_nodes > LOBE_NODE_CAP;
+            if (!capped) {
+                if (ok) lobe_feas[idx] = key; else lobe_infeas[idx] = key;
+            }
+            ok = ok || capped;
+        }
+        if (ok) return true;
+    }
+
+    /* entry modes directly from the head into a lobe cell */
+    if (head >= 0) {
+        for (int d = 0; d < 4; d++) {
+            int f = head + DELTA[d];
+            if (blocked[f] || lobemark[f] != lobegen) continue;
+            if (lobe_entry_feasible(chash, (int)lobeslot[f], d))
+                return true;
+        }
+    }
+
+    st_p_lobe++;
+    return false;
+}
+
 static u64 work;             /* time-proxy budget counter */
 
 static bool analyze_region(int seed, int head);
@@ -284,16 +438,20 @@ static bool analyze_region(int seed, int head)
                 } else {
                     /* interior pop: all flags of this block are final */
                     sepflag[p] = 1;
-                    int cuts = 0;
+                    int cuts = 0, blkverts = 0;
                     int mstart = esp;   /* re-walk range for marking */
                     for (;;) {
                         int a = estack[--esp], b = eother[esp];
                         if (bcmark[a] != bcgen) {
                             bcmark[a] = bcgen;
+                            if (blkverts < LOBE_MAX) lb_cells[blkverts] = a;
+                            blkverts++;
                             if (sepflag[a]) cuts++;
                         }
                         if (bcmark[b] != bcgen) {
                             bcmark[b] = bcgen;
+                            if (blkverts < LOBE_MAX) lb_cells[blkverts] = b;
+                            blkverts++;
                             if (sepflag[b]) cuts++;
                         }
                         if (a == u && b == p) break;
@@ -311,6 +469,11 @@ static bool analyze_region(int seed, int head)
                                 lbid[eother[e]] = bid;
                             }
                         }
+                        /* pendant pocket: micro-refute if small */
+                        if (blkverts <= LOBE_MAX && blkverts < remaining) {
+                            lb_n = blkverts;
+                            if (!lobe_check(p, head)) return false;
+                        }
                     }
                 }
             }
@@ -325,16 +488,26 @@ static bool analyze_region(int seed, int head)
     bool root_cut = root_children >= 2;
     for (int i = 0; i < nrb; i++) {
         int cuts = rb_cuts[i] + (root_cut ? 1 : 0);
+        int end = (i + 1 < nrb) ? rb_start[i+1] : rbn;
         if (cuts <= 1) {
             if (++leafblocks >= 3) { st_p_lb3++; return false; }
             u8 bid = (u8)(leafblocks - 1);
-            int end = (i + 1 < nrb) ? rb_start[i+1] : rbn;
             for (int j = rb_start[i]; j < end; j++)
                 if (!sepflag[rbuf[j]]) {
                     leafmark[rbuf[j]] = markgen;
                     lbid[rbuf[j]] = bid;
                 }
             if (!root_cut) { leafmark[seed] = markgen; lbid[seed] = bid; }
+
+            /* pendant pocket hanging off the root: micro-refute */
+            int blkverts = end - rb_start[i] + 1;   /* + seed */
+            if (root_cut && blkverts <= LOBE_MAX && blkverts < remaining) {
+                for (int j = rb_start[i]; j < end; j++)
+                    lb_cells[j - rb_start[i]] = rbuf[j];
+                lb_cells[blkverts - 1] = seed;
+                lb_n = blkverts;
+                if (!lobe_check(seed, head)) return false;
+            }
         }
     }
 
@@ -519,6 +692,10 @@ static void print_stats(void)
         (unsigned long long)st_p_feas,
         (unsigned long long)st_p_dirs,
         (unsigned long long)st_p_tt);
+    fprintf(stderr, "  lobes: solves=%llu hits=%llu prunes=%llu\n",
+        (unsigned long long)st_lobe_solves,
+        (unsigned long long)st_lobe_hits,
+        (unsigned long long)st_p_lobe);
 }
 
 static bool dfs(int pos)
@@ -709,6 +886,10 @@ int main(void)
     tt      = calloc((size_t)1 << TT_BITS, sizeof(u64));
     zkey    = malloc((size_t)NCELLS * sizeof(u64));
     zheadkey = malloc((size_t)NCELLS * sizeof(u64));
+    lobemark = calloc(NCELLS, sizeof(u32));
+    lobeslot = calloc(NCELLS, sizeof(u32));
+    lobe_feas   = calloc((size_t)1 << LOBE_TT_BITS, sizeof(u64));
+    lobe_infeas = calloc((size_t)1 << LOBE_TT_BITS, sizeof(u64));
     {
         u64 s = 0x243f6a8885a308d3ULL;
         for (int i = 0; i < NCELLS; i++) {
