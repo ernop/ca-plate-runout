@@ -69,6 +69,21 @@ static u64 rng = 0x9e3779b97f4a7c15ULL;
 static u64 seed_salt = 0x9e3779b97f4a7c15ULL;
 static u32 *mark;
 static u32 markgen;
+/*
+ * Op accounting: every interaction with the board state costs ops,
+ * weighted by realistic CPU/memory cost. The benchmark currency is ops,
+ * not wall time; runs stop deterministically at COIL_OPS_LIMIT.
+ *   visit/unvisit cell   8  (state, parity, hash, 4 neighbor degrees)
+ *   slide sim step       1  (one cell read)
+ *   branch node          12 (enumeration, ordering, TT probe)
+ *   region scan, /cell   6  (Tarjan + forced-edge bookkeeping)
+ *   lobe build, /cell    4
+ *   lobe search node     6
+ *   start attempt        16
+ */
+static u64 ops, ops_limit;
+static bool ops_out;         /* op budget exhausted: stop everything */
+
 static u64 st_region_calls, st_region_cells, st_visits, st_branches;
 static u64 st_p_parity, st_p_struct, st_p_conn, st_p_lb3, st_p_cyc,
            st_p_over, st_p_feas, st_p_dirs, st_p_tt;
@@ -111,6 +126,7 @@ static inline void visit_cell(int p)
     if (!blocked[p+PW]) dec_deg(p+PW);
     vlog[vloglen++] = p;
     st_visits++;
+    ops += 8;
 }
 
 static void rewind_to(int loglen, int plen)
@@ -126,6 +142,7 @@ static void rewind_to(int loglen, int plen)
         if (!blocked[p+PW]) inc_deg(p+PW);
         if (deg[p] == 1) nleaf++;
         else if (deg[p] == 0) nisol++;
+        ops += 8;
     }
     pathlen = plen;
 }
@@ -201,6 +218,7 @@ static u64 st_lobe_solves, st_lobe_hits, st_p_lobe;
 
 static bool lobe_dfs(u64 mask, int p)
 {
+    ops += 6;
     if ((mask & lb_need) == lb_need) return true;
     if (++lb_micro_nodes > LOBE_NODE_CAP) return true; /* unknown: no prune */
     for (int d = 0; d < 4; d++) {
@@ -252,6 +270,7 @@ static bool lobe_entry_feasible(u64 chash, int f, int d)
 static u64 lobe_build(void)
 {
     lobegen++;
+    ops += (u64)lb_n * 4;
     u64 h = 0;
     for (int i = 0; i < lb_n; i++) {
         lobemark[lb_cells[i]] = lobegen;
@@ -482,6 +501,7 @@ static bool analyze_region(int seed, int head)
 
     work += (u32)cnt >> 3;
     st_region_calls++; st_region_cells += cnt;
+    ops += (u64)cnt * 6;
     if (cnt != remaining) { st_p_conn++; return false; }
 
     /* classify deferred root blocks */
@@ -637,6 +657,18 @@ static bool dirty_conn;
 static bool always_check;   /* run region_ok at every branch node */
 static u32 checktick, checkmask;  /* gate region_ok to every (mask+1)th */
 
+/* Local change analysis: seeds = first free cell of each side-run along
+ * the last painted ray. A capped flood from a seed that CLOSES (finds a
+ * whole component) smaller than the region proves a sealed pocket. */
+#define LSEED_MAX 8
+#define LFLOOD_CAP 64
+static s32 lseeds[LSEED_MAX];
+static int nlseeds;
+static bool lseeds_valid;
+static bool use_local;       /* measured net-negative at <=70x70; the
+                                foundation for incremental structure */
+static u64 st_p_local, st_local_floods;
+
 /* Slide and paint; detects split-risk by counting contiguous runs of free
  * cells along both sides of the painted ray (>=2 runs => possible split). */
 static inline int do_slide(int pos, int d)
@@ -645,16 +677,24 @@ static inline int do_slide(int pos, int d)
     s32 pp = (d == 0 || d == 2) ? PW : 1;   /* perpendicular delta */
     int runs = 0;
     bool pl = false, pr = false;
+    nlseeds = 0;
     do {
         pos += dd;
         visit_cell(pos);
         bool l = free_cell(pos - pp);
         bool r = free_cell(pos + pp);
-        if (l && !pl) runs++;
-        if (r && !pr) runs++;
+        if (l && !pl) {
+            runs++;
+            if (nlseeds < LSEED_MAX) lseeds[nlseeds++] = pos - pp;
+        }
+        if (r && !pr) {
+            runs++;
+            if (nlseeds < LSEED_MAX) lseeds[nlseeds++] = pos + pp;
+        }
         pl = l; pr = r;
     } while (free_cell(pos + dd));
     if (runs >= 2) dirty_conn = true;
+    lseeds_valid = (runs >= 2) && (runs <= LSEED_MAX);
     return pos;
 }
 
@@ -667,10 +707,17 @@ static inline int sim_slide(int pos, int d, int *len, int *endopts)
     int n = 0;
     do { pos += dd; n++; } while (free_cell(pos + dd));
     *len = n;
+    ops += (u32)n;
     /* perpendicular neighbors of the end; ray cells are not perpendicular
      * to the end cell, so current free state is accurate */
     *endopts = free_cell(pos - pp) + free_cell(pos + pp);
     return pos;
+}
+
+static void ops_report(int solved)
+{
+    fprintf(stderr, "OPSRESULT solved=%d ops=%llu\n",
+            solved, (unsigned long long)ops);
 }
 
 static void print_stats(void)
@@ -698,6 +745,42 @@ static void print_stats(void)
         (unsigned long long)st_p_lobe);
 }
 
+/* Capped floods from the last slide's side-runs. Any closed component
+ * smaller than the region is a sealed, unreachable pocket: dead. If one
+ * flood closes over the WHOLE region, connectivity is re-certified for
+ * free. Cost is bounded by the change, not the region. */
+static bool local_ok(void)
+{
+    lseeds_valid = false;
+    int top;
+    for (int s = 0; s < nlseeds; s++) {
+        int seed = lseeds[s];
+        markgen++;   /* fresh generation: capped floods must not leak */
+        if (blocked[seed] || mark[seed] == markgen) continue;
+        st_local_floods++;
+        top = 0;
+        tstack[top++] = seed; mark[seed] = markgen;
+        int cnt = 1;
+        bool capped = false;
+        while (top) {
+            int q = tstack[--top];
+            for (int d = 0; d < 4; d++) {
+                int nb = q + DELTA[d];
+                if (blocked[nb] || mark[nb] == markgen) continue;
+                mark[nb] = markgen;
+                tstack[top++] = nb;
+                if (++cnt > LFLOOD_CAP) { capped = true; top = 0; break; }
+            }
+        }
+        ops += (u32)cnt * 2;
+        if (capped) continue;
+        if (cnt < remaining) { st_p_local++; return false; }
+        dirty_conn = false;     /* one component covers everything */
+        return true;
+    }
+    return true;
+}
+
 static bool dfs(int pos)
 {
     for (;;) {
@@ -705,6 +788,7 @@ static bool dfs(int pos)
         if (aborted) return false;
         if (!struct_ok(pos)) { st_p_struct++; return false; }
         if (!parity_ok(pos)) { st_p_parity++; return false; }
+        if (use_local && lseeds_valid && !local_ok()) return false;
 
         int dirs[4], nd = 0;
         for (int i = 0; i < 4; i++) {
@@ -755,6 +839,10 @@ static bool dfs(int pos)
         }
 
         nodes++; work++; st_branches++;
+        ops += 12;
+        if (ops_limit && ops > ops_limit) {
+            ops_out = true; aborted = true; return false;
+        }
         if (remaining < best_remaining) {
             best_remaining = remaining;
             work_at_best = work;
@@ -769,7 +857,9 @@ static bool dfs(int pos)
         /* Region analysis cadence scales with region size: a scan costs
          * O(remaining), so near the root (huge region, weak structure)
          * scan sparsely; deep down (small region, dense structure) scan
-         * every branch node, where scans are cheap and prunes are likely. */
+         * every branch node, where scans are cheap and prunes are likely.
+         * Sealed-pocket detection is handled at every slide by local_ok,
+         * so full scans are needed only for cut/block structure. */
         bool fresh_region = false;
         u32 cadence = (u32)(remaining >> 9);
         if ((dirty_conn || always_check) &&
@@ -846,6 +936,8 @@ static bool solve_from(int start)
     visit_cell(start);
     nodes = 0; work = 0; aborted = false;
     best_remaining = remaining; work_at_best = 0;
+    lseeds_valid = false;
+    ops += 16;
     if (dfs(start)) return true;
     rewind_to(saveL, saveP);
     return false;
@@ -1027,6 +1119,8 @@ int main(void)
     order_mode = getenv("COIL_ORDER") ? atoi(getenv("COIL_ORDER")) : 0;
     randtie = getenv("COIL_NORANDTIE") == NULL;        /* default: on */
     checkmask = getenv("COIL_CHECK_EVERY") ? (u32)atoi(getenv("COIL_CHECK_EVERY")) - 1 : 3;
+    ops_limit = getenv("COIL_OPS_LIMIT") ? strtoull(getenv("COIL_OPS_LIMIT"), NULL, 10) : 0;
+    use_local = getenv("COIL_LOCAL") != NULL;
     if (getenv("COIL_SEED"))
         seed_salt ^= (u64)strtoull(getenv("COIL_SEED"), NULL, 10) * 0xc2b2ae3d27d4eb4fULL;
     else
@@ -1156,12 +1250,14 @@ int main(void)
                         path[pathlen] = 0;
                         fprintf(out, "x=%d&y=%d&path=%s\n", sx, sy, path);
                         fflush(out);
+                        ops_report(1);
                         print_stats();
                         _exit(0);
                     }
                     if (anyalive) {
                         act[alive] = k; prog[alive] = bestp; alive++;
                     }
+                    if (ops_out) break;
                 }
                 greedy_probe = false;
 
@@ -1192,16 +1288,20 @@ int main(void)
                             path[pathlen] = 0;
                             fprintf(out, "x=%d&y=%d&path=%s\n", sx, sy, path);
                             fflush(out);
+                            ops_report(1);
                             print_stats();
                             _exit(0);
                         }
                         if (aborted) {
                             act[kept] = k; prog[kept] = best_remaining; kept++;
                         }
+                        if (ops_out) break;
                     }
                     alive = kept;
+                    if (ops_out) break;
                 }
                 if (nworkers == 1) printf("No solution found\n");
+                ops_report(0);
                 print_stats();
                 _exit(1);
             }
