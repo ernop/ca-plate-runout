@@ -630,13 +630,18 @@ int main(void)
             }
             FILE *out = fdopen(pipes[w][1], "w");
             for (int i = 0; i < 4; i++) dirperm[i] = (i + w) & 3;
+            if (!getenv("COIL_CHECK_EVERY")) {
+                /* diversify region-check cadence across workers */
+                static const u32 kdiv[4] = {7, 3, 11, 15};
+                checkmask = kdiv[w & 3];
+            }
 
             u8 *dead = calloc(ns, 1);
             /* work units scale with board size (region scans dominate).
              * Winning starts typically solve within a few thousand branch
              * nodes; scan many starts cheaply before going deep. */
             u64 scale = 1 + (u64)total_empty / 8;
-            u64 budgets[] = {250, 4000, 32000, 256000, 4000000, 64000000, (u64)1<<44};
+            u64 budgets[] = {1000, 8000, 64000, 512000, 8000000, 128000000, (u64)1<<44};
             int ntiers = 7;
             for (int bi = 0; bi < ntiers; bi++) {
                 node_budget = budgets[bi] * scale;
