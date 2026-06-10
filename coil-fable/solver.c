@@ -816,16 +816,15 @@ int main(void)
     always_check = getenv("COIL_LAZY_CHECK") == NULL;  /* default: always */
     order_mode = getenv("COIL_ORDER") ? atoi(getenv("COIL_ORDER")) : 0;
     randtie = getenv("COIL_NORANDTIE") == NULL;        /* default: on */
-    checkmask = getenv("COIL_CHECK_EVERY") ? (u32)atoi(getenv("COIL_CHECK_EVERY")) - 1 : 7;
+    checkmask = getenv("COIL_CHECK_EVERY") ? (u32)atoi(getenv("COIL_CHECK_EVERY")) - 1 : 3;
     if (getenv("COIL_SEED"))
         seed_salt ^= (u64)strtoull(getenv("COIL_SEED"), NULL, 10) * 0xc2b2ae3d27d4eb4fULL;
     else
         seed_salt ^= ((u64)time(NULL) * 0xc2b2ae3d27d4eb4fULL) ^ ((u64)getpid() << 32);
 
-    /* Shuffle the start order (keeping proven-endpoint leaves first) so
-     * every attempt scans a different prefix: winning starts are sparse
-     * and a fixed order makes restarts re-tread the same ground. */
-    if (getenv("COIL_NOSHUFFLE") == NULL && nleaves < 2) {
+    /* Shuffle the start order (only useful for randomized-restart modes;
+     * the default two-pass sweep is deterministic and complete). */
+    if (getenv("COIL_SHUFFLE") != NULL && nleaves < 2) {
         int lo = (nleaves == 1) ? 1 : 0;
         u64 r = seed_salt ^ 0xa076bca5915f7445ULL;
         for (int i = ns - 1; i > lo; i--) {
@@ -864,9 +863,9 @@ int main(void)
             }
             FILE *out = (nworkers > 1) ? fdopen(pipes[w][1], "w") : stdout;
             for (int i = 0; i < 4; i++) dirperm[i] = (i + w) & 3;
-            if (!getenv("COIL_CHECK_EVERY")) {
+            if (!getenv("COIL_CHECK_EVERY") && nworkers > 1) {
                 /* diversify region-check cadence across workers */
-                static const u32 kdiv[4] = {7, 3, 11, 15};
+                static const u32 kdiv[4] = {3, 1, 7, 11};
                 checkmask = kdiv[w & 3];
             }
             if (!getenv("COIL_ORDER")) {
