@@ -48,3 +48,4 @@ Every command finishes inside 10 seconds. Single thread. Ops only.
 - viz_6_opsdepth.png       ops by search depth: scans dominate at 75-87%
 - viz_7_loophistory.png    iteration ledger: accepted/rejected, op deltas
 - viz_8_fragmentation.png  block fragmentation by depth (Stage B sizing)
+- viz_9_scalewall.png      refutation cost vs board size (the scale wall)
