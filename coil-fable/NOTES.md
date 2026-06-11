@@ -49,6 +49,24 @@ Also note: refutation cost is ordering-invariant (a complete refutation
 sums over all children regardless of order), so move-ordering work
 cannot reduce dead-start cost, only winner discovery position.
 
+## ITER 6 - scale tier: gated rules at 170x169; the scale wall (viz_9)
+Hypothesis (PLAN item 2): chain-block and lobe-parity rules activate at
+level-500 corridor densities.
+Measured on level 501, 300M ops: chain=0 fires, lbpar=0 fires (chain
+mode queries flood the lobe cache - 785k hits - but never refute).
+REJECTED: scale does not activate them at this geometry.
+Decisive side-measurement: 300M ops covers TWO start refutations at 501
+(~150M ops each); the ~9k-start field needs ~1.4T ops. Refutation cost
+grows super-quadratically in cells (31:1.3k, 101:60k, 201:450k,
+501:150M). Profile at 501: struct counters prune 491k times vs conn 6k -
+the tree is dominated by open-area walk enumeration that no global
+claim touches, and the TT shares nothing (states never recur exactly).
+CONCLUSION: at scale the binding phenomenon is exponential equivalent-
+walk enumeration with zero state sharing. The remaining routes are
+(a) sub-block dynamic structure, (b) abstraction-level state sharing
+(canonical fragment verdicts not anchored to cut vertices). Both are
+long-horizon; everything cheaper is now measured out.
+
 ## ITER 4 - Stage A of incremental structure: record the decomposition
 Change: every full scan tags blkid/cutflag per cell (generation-tagged)
 and records per-block size and leaf status. COIL_PARANOID verifies the

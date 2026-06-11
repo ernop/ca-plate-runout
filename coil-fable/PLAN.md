@@ -14,15 +14,19 @@ scans concentrate (viz_8). Replacement directions, in order:
  1. Sub-block incrementality: dynamic biconnectivity with rollback over
     the giant block. Research-grade; the only route that cuts the
     dominant term at source. Long horizon.
- 2. Scale-adaptive claims: the gated rules (chain blocks, lobe parity)
-    are expected to fire at level-500+ corridor densities; build a
-    larger benchmark tier first (e.g. add level 501 with a 1G-op
-    budget) and re-measure them there.
+ 2. DONE/REJECTED (ITER 6): gated rules stay inert at 501; scale wall
+    quantified at ~150M ops per refutation, ~1.4T per level (viz_9).
  3. Giant-block-phase paradigm: while the region is one block with no
     structure, scans yield only connectivity; investigate whether the
     scan can be split (cheap flood always, Tarjan only once structure
     is plausible: e.g. when nleaf/deg-2 counts change regime). Must be
     falsifiable by the bench; beware claim starvation (design #2).
+ 4. NEW (from ITER 6): abstraction-level state sharing. Refutation
+    subtrees over the same untouched sub-area are near-isomorphic
+    across prefixes, but exact-state TT shares nothing. A sound
+    canonicalization (fragment + entry interface, generalizing the
+    lobe verdicts beyond cut-vertex anchors) is the only mechanism
+    family that attacks the exponential walk enumeration itself.
 
 ## Superseded: Stage B - delta re-analysis (consumes Stage A)
 At a scan point, if a valid decomposition exists from an earlier scan
