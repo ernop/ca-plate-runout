@@ -88,6 +88,9 @@ static bool ops_out;         /* op budget exhausted: stop everything */
 /* where do ops go, by depth? bucket = 8*remaining/total (7=near start) */
 static u64 hist_region[8], hist_visit[8], hist_branch[8];
 static u64 hist_rcall[8], hist_rprune[8], hist_pconn[8];
+/* fragmentation per depth bucket (struct mode): avg largest-block share
+ * of the region (permil) and avg block count, per scan */
+static u64 frag_share[8], frag_blocks[8], frag_n[8];
 
 #define LSEED_MAX 8
 #define LFLOOD_CAP 64
@@ -796,6 +799,17 @@ static bool analyze_region(int seed, int head)
 
     last_leafblocks = leafblocks;
 
+    if (use_struct) {
+        int big = 0;
+        for (int i = 0; i < nblocks; i++)
+            if (blk_size[i] > big) big = blk_size[i];
+        int hb = (remaining * 7) / (total_empty + 1);
+        frag_share[hb] += (u64)big * 1000 / (cnt ? cnt : 1);
+        frag_blocks[hb] += (u64)nblocks;
+        frag_n[hb]++;
+        ops += (u64)nblocks;
+    }
+
     /* Stage A invariant verification: every free cell tagged this scan,
      * non-cut ordinals valid. Catches bookkeeping drift immediately. */
     if (use_struct && paranoid) {
@@ -1056,6 +1070,14 @@ static void print_stats(void)
     fprintf(stderr, "\n  hist_pconn:");
     for (int i = 7; i >= 0; i--)
         fprintf(stderr, " %llu", (unsigned long long)hist_pconn[i]);
+    fprintf(stderr, "\n  frag(share permil,blocks,n):");
+    for (int i = 7; i >= 0; i--) {
+        u64 n = frag_n[i] ? frag_n[i] : 1;
+        fprintf(stderr, " [%llu,%llu,%llu]",
+                (unsigned long long)(frag_share[i] / n),
+                (unsigned long long)(frag_blocks[i] / n),
+                (unsigned long long)frag_n[i]);
+    }
     fprintf(stderr, "\n");
 }
 
