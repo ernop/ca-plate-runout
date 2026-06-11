@@ -49,6 +49,22 @@ Also note: refutation cost is ordering-invariant (a complete refutation
 sums over all children regardless of order), so move-ordering work
 cannot reduce dead-start cost, only winner discovery position.
 
+## ITER 8 - local-state redundancy: the sharing premise validated (viz_11)
+Hypothesis (PLAN item 4 feasibility): refutation trees revisit the same
+local configurations under different global states.
+Measured (canonical 7x7 head-neighborhood hash at every branch node):
+level 201: 121,061 nodes / 3,865 distinct = 31:1. Level 501: 711,635
+nodes / 677 distinct = 1051:1 - and the ratio GROWS with scale, exactly
+where the scale wall lives.
+VALIDATED: each distinct local pattern at 501 is revisited ~1000x, so
+even expensive per-pattern analysis amortizes. Next: design the sound
+exploitation - per-window verdicts that hold regardless of outside
+structure (candidates: forced local leaf creation within K moves;
+local coverability bounds over all boundary interfaces). Soundness
+requirement: a window verdict may only use facts invariant to the
+unseen remainder, exactly like the lobe verdicts but with multi-cell
+interfaces.
+
 ## ITER 7 - leaf-block sizes and attempt anatomy at 501 (viz_10)
 Hypothesis: the load-bearing block claims come from small satellite
 blocks, making a split scan (flood the giant block, Tarjan satellites)

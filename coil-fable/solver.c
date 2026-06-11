@@ -93,6 +93,31 @@ static u64 hist_rcall[8], hist_rprune[8], hist_pconn[8];
 static u64 frag_share[8], frag_blocks[8], frag_n[8];
 /* ITER 7: size profile of CLASSIFIED leaf blocks (claim sources) */
 static u64 st_leaf_cnt, st_leaf_cells, st_leaf_max, st_leaf_giant;
+/* ITER 8: local-state redundancy probe. Canonical hash of the KxK
+ * neighborhood around the head at every branch node; counts total vs
+ * distinct. Instrumentation only (COIL_LH), charged no ops. */
+static u64 *lh_set;
+static u64 lh_total, lh_distinct;
+static bool use_lh;
+#define LH_BITS 22
+static void lh_probe(int pos)
+{
+    u64 h = 0x9e3779b97f4a7c15ULL;
+    for (int dy = -3; dy <= 3; dy++)
+        for (int dx = -3; dx <= 3; dx++) {
+            h = (h << 1) | (h >> 63);
+            h ^= blocked[pos + dy * PW + dx] ? 0xff51afd7ed558ccdULL : 0;
+            h *= 0xc2b2ae3d27d4eb4fULL;
+        }
+    lh_total++;
+    u32 idx = (u32)(h >> (64 - LH_BITS));
+    for (int probe = 0; probe < 8; probe++) {
+        u32 i = (idx + probe) & ((1u << LH_BITS) - 1);
+        if (lh_set[i] == h) return;
+        if (lh_set[i] == 0) { lh_set[i] = h; lh_distinct++; return; }
+    }
+    lh_distinct++;   /* table pressure: counted distinct (conservative) */
+}
 
 #define LSEED_MAX 8
 #define LFLOOD_CAP 64
@@ -1083,6 +1108,10 @@ static void print_stats(void)
     fprintf(stderr, "\n  hist_pconn:");
     for (int i = 7; i >= 0; i--)
         fprintf(stderr, " %llu", (unsigned long long)hist_pconn[i]);
+    if (use_lh)
+        fprintf(stderr, "  lh: total=%llu distinct=%llu ratio=%.1f\n",
+            (unsigned long long)lh_total, (unsigned long long)lh_distinct,
+            lh_total / (double)(lh_distinct ? lh_distinct : 1));
     fprintf(stderr, "\n  leafblk: cnt=%llu avg=%llu max=%llu giant=%llu",
         (unsigned long long)st_leaf_cnt,
         (unsigned long long)(st_leaf_cells / (st_leaf_cnt ? st_leaf_cnt : 1)),
@@ -1530,6 +1559,7 @@ static bool dfs(int pos)
         }
 
         nodes++; work++; st_branches++;
+        if (use_lh) lh_probe(pos);
         ops += 12;
         hist_branch[(remaining * 7) / (total_empty + 1)]++;
         if (ops_limit && ops > ops_limit) {
@@ -1852,6 +1882,8 @@ int main(void)
                                                  misses pocket-scale structure */
     use_chain = getenv("COIL_CHAIN") != NULL;
     use_struct = getenv("COIL_STRUCT") != NULL;
+    use_lh = getenv("COIL_LH") != NULL;
+    if (use_lh) lh_set = calloc((size_t)1 << LH_BITS, sizeof(u64));
     paranoid = getenv("COIL_PARANOID") != NULL;
     if (getenv("COIL_SEED"))
         seed_salt ^= (u64)strtoull(getenv("COIL_SEED"), NULL, 10) * 0xc2b2ae3d27d4eb4fULL;
