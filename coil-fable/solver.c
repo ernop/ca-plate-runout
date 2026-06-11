@@ -91,6 +91,8 @@ static u64 hist_rcall[8], hist_rprune[8], hist_pconn[8];
 /* fragmentation per depth bucket (struct mode): avg largest-block share
  * of the region (permil) and avg block count, per scan */
 static u64 frag_share[8], frag_blocks[8], frag_n[8];
+/* ITER 7: size profile of CLASSIFIED leaf blocks (claim sources) */
+static u64 st_leaf_cnt, st_leaf_cells, st_leaf_max, st_leaf_giant;
 
 #define LSEED_MAX 8
 #define LFLOOD_CAP 64
@@ -686,6 +688,10 @@ static bool analyze_region(int seed, int head)
                         if (!chain_check(p, c_other, head)) return false;
                     }
                     if (cuts <= 1 && blkverts < remaining) {
+                        st_leaf_cnt++;
+                        st_leaf_cells += (u64)blkverts;
+                        if ((u64)blkverts > st_leaf_max) st_leaf_max = blkverts;
+                        if (blkverts * 2 > remaining) st_leaf_giant++;
                         if (++leafblocks >= 3) { st_p_lb3++; return false; }
                         u8 bid = (u8)(leafblocks - 1);
                         for (int e = esp; e < mstart; e++) {
@@ -763,6 +769,13 @@ static bool analyze_region(int seed, int head)
             ops += (u64)(end - rb_start[i] + 1);
         }
         if (cuts <= 1) {
+            {
+                int bv = end - rb_start[i] + 1;
+                st_leaf_cnt++;
+                st_leaf_cells += (u64)bv;
+                if ((u64)bv > st_leaf_max) st_leaf_max = bv;
+                if (bv * 2 > remaining) st_leaf_giant++;
+            }
             if (++leafblocks >= 3) { st_p_lb3++; return false; }
             u8 bid = (u8)(leafblocks - 1);
             for (int j = rb_start[i]; j < end; j++)
@@ -1070,6 +1083,11 @@ static void print_stats(void)
     fprintf(stderr, "\n  hist_pconn:");
     for (int i = 7; i >= 0; i--)
         fprintf(stderr, " %llu", (unsigned long long)hist_pconn[i]);
+    fprintf(stderr, "\n  leafblk: cnt=%llu avg=%llu max=%llu giant=%llu",
+        (unsigned long long)st_leaf_cnt,
+        (unsigned long long)(st_leaf_cells / (st_leaf_cnt ? st_leaf_cnt : 1)),
+        (unsigned long long)st_leaf_max,
+        (unsigned long long)st_leaf_giant);
     fprintf(stderr, "\n  frag(share permil,blocks,n):");
     for (int i = 7; i >= 0; i--) {
         u64 n = frag_n[i] ? frag_n[i] : 1;
