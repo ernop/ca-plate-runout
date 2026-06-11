@@ -34,6 +34,21 @@ hugging slides (runs<=1) still create cut structure, so skipping their
 scans starves claims (the falsified design-2 mechanism). CLOSED: scan
 frequency is irreducible without maintained structure.
 
+## ITER 5 - Stage B feasibility: fragmentation by depth (viz_8)
+Hypothesis: delta re-analysis of ray-touched blocks pays if the region
+fragments where scans concentrate.
+Measured (COIL_STRUCT instrumentation): the largest block holds 99.1%
+of the region at the dominant bucket on 201 (97.5% on 101), ~8 blocks
+per scan, and stays >94% even deep down. Rays virtually always touch
+the giant block.
+VERDICT: Stage B in block granularity is FALSIFIED BEFORE BUILDING -
+re-analyzing touched blocks equals re-analyzing the region. Cutting
+scan cost requires SUB-block incrementality (dynamic biconnectivity
+with rollback) or a different paradigm for the giant-block phase.
+Also note: refutation cost is ordering-invariant (a complete refutation
+sums over all children regardless of order), so move-ordering work
+cannot reduce dead-start cost, only winner discovery position.
+
 ## ITER 4 - Stage A of incremental structure: record the decomposition
 Change: every full scan tags blkid/cutflag per cell (generation-tagged)
 and records per-block size and leaf status. COIL_PARANOID verifies the
