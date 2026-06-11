@@ -49,6 +49,24 @@ Also note: refutation cost is ordering-invariant (a complete refutation
 sums over all children regardless of order), so move-ordering work
 cannot reduce dead-start cost, only winner discovery position.
 
+## ITER 7 - leaf-block sizes and attempt anatomy at 501 (viz_10)
+Hypothesis: the load-bearing block claims come from small satellite
+blocks, making a split scan (flood the giant block, Tarjan satellites)
+viable at scale.
+Measured: leaf blocks at 501 average 11 cells (67,543 classified, one
+ever giant) - claim sources ARE tiny satellites; at 201 they average
+309 with 11% giant (mid-scale is mixed). BUT attempt anatomy at 501
+shows the real binding constraint: most starts die instantly (300-13k
+ops); the first nontrivial start's PASS-1-CAPPED attempt consumes
+~290M ops in every configuration (default / window+lazy / rind
+identical to within 0.1%). The per-start budget (450 x empty work
+units) is itself ~quadratic in ops at scale: one capped attempt
+~10^9 ops at 501, the field ~10^13.
+VERDICT: split-scan economics are real but NOT decisive; at scale the
+sweep architecture's per-start budgets dominate. The decisive lever
+remains abstraction-level state sharing (PLAN item 4) - sub-exponential
+refutation - not cheaper scan units.
+
 ## ITER 6 - scale tier: gated rules at 170x169; the scale wall (viz_9)
 Hypothesis (PLAN item 2): chain-block and lobe-parity rules activate at
 level-500 corridor densities.
