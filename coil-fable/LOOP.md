@@ -52,3 +52,4 @@ Every command finishes inside 10 seconds. Single thread. Ops only.
 - viz_10_attemptanatomy.png  attempt anatomy at 501: budgets dominate
 - viz_11_redundancy.png    local-state redundancy: 1051:1 at level 501
 - viz_12_hotwindows.png    hot windows are structured: verdict engine viable
+- viz_13_windowtension.png geometric windows falsified: share-vs-bind tension

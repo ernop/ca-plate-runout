@@ -49,6 +49,24 @@ Also note: refutation cost is ordering-invariant (a complete refutation
 sums over all children regardless of order), so move-ordering work
 cannot reduce dead-start cost, only winner discovery position.
 
+## ITER 10a - window verdicts falsified by prototype (viz_13)
+Built the outside-optimistic local refuter as an offline prototype and
+ran it on the 677 real patterns from 501: refutable patterns = 0,
+bindable traffic = 0.0%. Slides leave a radius-3 window before dying,
+and soundness forces exits to count as rescue.
+The measured tension: small windows share massively (1051:1 at r=3)
+but bind nothing; slide-scale windows (r ~ 10-20) could bind but every
+window is then unique - no sharing. Geometric windows are the wrong
+abstraction unit.
+SURVIVING ROUTE: connectivity-closed fragments with small interfaces -
+the lobe (1-cell interface) and chain (2-cell interface) caches are the
+sound special cases that already work. Generalization target:
+k-interface fragments (k=3,4) discovered during the scan as near-cut
+structures, verdict tables over interface modes, content-cached.
+Costs grow exponentially in k but k<=4 is bounded; fragment discovery
+must not require new scans (fold into existing Tarjan pops: blocks
+with k cut-adjacent boundary cells).
+
 ## ITER 9 - exploitability kill-test: hot windows are structured (viz_12)
 Hypothesis to falsify: the 1051:1 redundancy is concentrated in
 structureless (nearly all-free) windows where no outside-invariant
