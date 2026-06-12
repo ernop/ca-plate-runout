@@ -99,17 +99,21 @@ static u64 st_leaf_cnt, st_leaf_cells, st_leaf_max, st_leaf_giant;
 static u64 *lh_set;
 static u32 *lh_count;
 static u16 *lh_blocked;
+static u64 *lh_pat;          /* 49-bit blocked mask, row-major, head=center */
 static u64 lh_total, lh_distinct;
 static bool use_lh;
 #define LH_BITS 22
 static void lh_probe(int pos)
 {
     u64 h = 0x9e3779b97f4a7c15ULL;
-    int nb = 0;
+    u64 pat = 0;
+    int nb = 0, bit = 0;
     for (int dy = -3; dy <= 3; dy++)
-        for (int dx = -3; dx <= 3; dx++) {
+        for (int dx = -3; dx <= 3; dx++, bit++) {
             h = (h << 1) | (h >> 63);
-            if (blocked[pos + dy * PW + dx]) { h ^= 0xff51afd7ed558ccdULL; nb++; }
+            if (blocked[pos + dy * PW + dx]) {
+                h ^= 0xff51afd7ed558ccdULL; nb++; pat |= (u64)1 << bit;
+            }
             h *= 0xc2b2ae3d27d4eb4fULL;
         }
     lh_total++;
@@ -119,6 +123,7 @@ static void lh_probe(int pos)
         if (lh_set[i] == h) { lh_count[i]++; return; }
         if (lh_set[i] == 0) {
             lh_set[i] = h; lh_count[i] = 1; lh_blocked[i] = (u16)nb;
+            lh_pat[i] = pat;
             lh_distinct++;
             return;
         }
@@ -1136,6 +1141,13 @@ static void print_stats(void)
         }
         fprintf(stderr, "  lh top1=%.1f%% top10=%.1f%%\n",
             100.0 * c1 / lh_total, 100.0 * c10 / lh_total);
+        if (getenv("COIL_LH_DUMP")) {
+            u32 szz = 1u << LH_BITS;
+            for (u32 i = 0; i < szz; i++)
+                if (lh_set[i])
+                    fprintf(stderr, "LHPAT %llu %u\n",
+                        (unsigned long long)lh_pat[i], lh_count[i]);
+        }
     }
     fprintf(stderr, "\n  leafblk: cnt=%llu avg=%llu max=%llu giant=%llu",
         (unsigned long long)st_leaf_cnt,
@@ -1912,6 +1924,7 @@ int main(void)
         lh_set = calloc((size_t)1 << LH_BITS, sizeof(u64));
         lh_count = calloc((size_t)1 << LH_BITS, sizeof(u32));
         lh_blocked = calloc((size_t)1 << LH_BITS, sizeof(u16));
+        lh_pat = calloc((size_t)1 << LH_BITS, sizeof(u64));
     }
     paranoid = getenv("COIL_PARANOID") != NULL;
     if (getenv("COIL_SEED"))
