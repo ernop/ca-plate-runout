@@ -97,26 +97,33 @@ static u64 st_leaf_cnt, st_leaf_cells, st_leaf_max, st_leaf_giant;
  * neighborhood around the head at every branch node; counts total vs
  * distinct. Instrumentation only (COIL_LH), charged no ops. */
 static u64 *lh_set;
+static u32 *lh_count;
+static u16 *lh_blocked;
 static u64 lh_total, lh_distinct;
 static bool use_lh;
 #define LH_BITS 22
 static void lh_probe(int pos)
 {
     u64 h = 0x9e3779b97f4a7c15ULL;
+    int nb = 0;
     for (int dy = -3; dy <= 3; dy++)
         for (int dx = -3; dx <= 3; dx++) {
             h = (h << 1) | (h >> 63);
-            h ^= blocked[pos + dy * PW + dx] ? 0xff51afd7ed558ccdULL : 0;
+            if (blocked[pos + dy * PW + dx]) { h ^= 0xff51afd7ed558ccdULL; nb++; }
             h *= 0xc2b2ae3d27d4eb4fULL;
         }
     lh_total++;
     u32 idx = (u32)(h >> (64 - LH_BITS));
     for (int probe = 0; probe < 8; probe++) {
         u32 i = (idx + probe) & ((1u << LH_BITS) - 1);
-        if (lh_set[i] == h) return;
-        if (lh_set[i] == 0) { lh_set[i] = h; lh_distinct++; return; }
+        if (lh_set[i] == h) { lh_count[i]++; return; }
+        if (lh_set[i] == 0) {
+            lh_set[i] = h; lh_count[i] = 1; lh_blocked[i] = (u16)nb;
+            lh_distinct++;
+            return;
+        }
     }
-    lh_distinct++;   /* table pressure: counted distinct (conservative) */
+    lh_distinct++;
 }
 
 #define LSEED_MAX 8
@@ -1108,10 +1115,28 @@ static void print_stats(void)
     fprintf(stderr, "\n  hist_pconn:");
     for (int i = 7; i >= 0; i--)
         fprintf(stderr, " %llu", (unsigned long long)hist_pconn[i]);
-    if (use_lh)
+    if (use_lh) {
         fprintf(stderr, "  lh: total=%llu distinct=%llu ratio=%.1f\n",
             (unsigned long long)lh_total, (unsigned long long)lh_distinct,
             lh_total / (double)(lh_distinct ? lh_distinct : 1));
+        /* traffic concentration + structure density of hot windows */
+        u32 sz = 1u << LH_BITS;
+        u64 c1 = 0, c10 = 0;
+        for (int rank = 0; rank < 10; rank++) {
+            u32 besti = 0; u32 bestc = 0;
+            for (u32 i = 0; i < sz; i++)
+                if (lh_count[i] > bestc) { bestc = lh_count[i]; besti = i; }
+            if (!bestc) break;
+            if (rank == 0) c1 = bestc;
+            c10 += bestc;
+            fprintf(stderr, "  lh top%d: visits=%u (%.1f%%) blocked=%u/49\n",
+                rank + 1, bestc, 100.0 * bestc / lh_total,
+                lh_blocked[besti]);
+            lh_count[besti] = 0;
+        }
+        fprintf(stderr, "  lh top1=%.1f%% top10=%.1f%%\n",
+            100.0 * c1 / lh_total, 100.0 * c10 / lh_total);
+    }
     fprintf(stderr, "\n  leafblk: cnt=%llu avg=%llu max=%llu giant=%llu",
         (unsigned long long)st_leaf_cnt,
         (unsigned long long)(st_leaf_cells / (st_leaf_cnt ? st_leaf_cnt : 1)),
@@ -1883,7 +1908,11 @@ int main(void)
     use_chain = getenv("COIL_CHAIN") != NULL;
     use_struct = getenv("COIL_STRUCT") != NULL;
     use_lh = getenv("COIL_LH") != NULL;
-    if (use_lh) lh_set = calloc((size_t)1 << LH_BITS, sizeof(u64));
+    if (use_lh) {
+        lh_set = calloc((size_t)1 << LH_BITS, sizeof(u64));
+        lh_count = calloc((size_t)1 << LH_BITS, sizeof(u32));
+        lh_blocked = calloc((size_t)1 << LH_BITS, sizeof(u16));
+    }
     paranoid = getenv("COIL_PARANOID") != NULL;
     if (getenv("COIL_SEED"))
         seed_salt ^= (u64)strtoull(getenv("COIL_SEED"), NULL, 10) * 0xc2b2ae3d27d4eb4fULL;

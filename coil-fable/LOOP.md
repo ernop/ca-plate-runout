@@ -51,3 +51,4 @@ Every command finishes inside 10 seconds. Single thread. Ops only.
 - viz_9_scalewall.png      refutation cost vs board size (the scale wall)
 - viz_10_attemptanatomy.png  attempt anatomy at 501: budgets dominate
 - viz_11_redundancy.png    local-state redundancy: 1051:1 at level 501
+- viz_12_hotwindows.png    hot windows are structured: verdict engine viable
