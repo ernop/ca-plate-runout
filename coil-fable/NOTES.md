@@ -49,6 +49,23 @@ Also note: refutation cost is ordering-invariant (a complete refutation
 sums over all children regardless of order), so move-ordering work
 cannot reduce dead-start cost, only winner discovery position.
 
+## ITER 9 - exploitability kill-test: hot windows are structured (viz_12)
+Hypothesis to falsify: the 1051:1 redundancy is concentrated in
+structureless (nearly all-free) windows where no outside-invariant
+claim can exist.
+Measured (per-pattern traffic + blocked density at 501): top-10
+patterns carry 32.6% of branch visits (top-1: 5.1%); their blocked
+densities are 17-33 of 49 cells (35-67%). The hot traffic flows
+through structured neighborhoods.
+SURVIVED: the window-verdict engine is justified. Build spec (ITER 10):
+outside-optimistic bounded local search per pattern - simulate within
+the window treating any slide that exits as success; if every line
+dies on window-internal facts (cells sealed by window-internal
+consumption that no outside behavior can rescue), the state is dead
+regardless of the remainder. Over-approximation = soundness; verdicts
+cached per canonical window content; ~700 patterns/level amortized
+over ~1000 visits each.
+
 ## ITER 8 - local-state redundancy: the sharing premise validated (viz_11)
 Hypothesis (PLAN item 4 feasibility): refutation trees revisit the same
 local configurations under different global states.

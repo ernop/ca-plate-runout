@@ -22,7 +22,8 @@ scans concentrate (viz_8). Replacement directions, in order:
     is plausible: e.g. when nleaf/deg-2 counts change regime). Must be
     falsifiable by the bench; beware claim starvation (design #2).
  4. PRIMARY (feasibility proven, ITER 8: 1051:1 local-state redundancy
-    at 501): abstraction-level state sharing. Refutation
+    at 501; hot windows structured, ITER 9): window-verdict engine -
+    outside-optimistic bounded local refutation, cached per pattern. Refutation
     subtrees over the same untouched sub-area are near-isomorphic
     across prefixes, but exact-state TT shares nothing. A sound
     canonicalization (fragment + entry interface, generalizing the
